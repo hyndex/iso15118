@@ -251,8 +251,9 @@ class CommunicationSessionHandler:
 
     async def check_status_task(self, send_status_update: bool) -> None:
         try:
-            # Configurable startup timeout (default 10s)
-            timeout_s = getattr(self.config, "server_start_timeout_s", 10.0)
+            # Configurable startup timeout (default 10s), capped by
+            # ISO15118 communication setup time (20s) to remain within spec.
+            timeout_s = min(getattr(self.config, "server_start_timeout_s", 10.0), 20.0)
             await asyncio.wait_for(self.check_ready_status(), timeout=timeout_s)
             if send_status_update:
                 await self.evse_controller.set_status(ServiceStatus.READY)
