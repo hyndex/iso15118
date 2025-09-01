@@ -223,7 +223,7 @@ class CommunicationSessionHandler:
         else:
             logger.info(f"UDP server disabled on {iface}")
 
-        self.tcp_server = TCPServer(self._rcv_queue, iface)
+        self.tcp_server = TCPServer(self._rcv_queue, iface, self.config)
 
         self.list_of_tasks.extend(
             [
@@ -251,12 +251,26 @@ class CommunicationSessionHandler:
 
     async def check_status_task(self, send_status_update: bool) -> None:
         try:
-            await asyncio.wait_for(self.check_ready_status(), timeout=10)
+            # Configurable startup timeout (default 10s)
+            timeout_s = getattr(self.config, "server_start_timeout_s", 10.0)
+            await asyncio.wait_for(self.check_ready_status(), timeout=timeout_s)
             if send_status_update:
                 await self.evse_controller.set_status(ServiceStatus.READY)
         except asyncio.TimeoutError:
             logger.error("Timeout: Servers failed to startup")
             await self.evse_controller.set_status(ServiceStatus.ERROR)
+            # If we timed out while starting the TCP server, proactively
+            # cancel the handler to avoid a dangling task that may flip
+            # ready later and confuse state handling.
+            if not send_status_update and self.tcp_server_handler:
+                try:
+                    await cancel_task(self.tcp_server_handler)
+                except Exception as e:
+                    logger.warning(
+                        f"Error cancelling TCP server handler after timeout: {e}"
+                    )
+                finally:
+                    self.tcp_server_handler = None
 
     async def get_from_rcv_queue(self, queue: asyncio.Queue):
         """
@@ -396,6 +410,25 @@ class CommunicationSessionHandler:
             )
         await self.check_status_task(False)
 
+        # If the server didn't become ready, fail fast so callers can
+        # handle it gracefully (e.g., by skipping SDP response for now).
+        if (
+            not getattr(self.tcp_server, "server", None)
+            or not getattr(self.tcp_server, "ipv6_address_host", None)
+        ):
+            # Ensure any partially started task is cleaned up
+            if self.tcp_server_handler:
+                try:
+                    await cancel_task(self.tcp_server_handler)
+                except Exception as e:
+                    logger.warning(
+                        f"Error cancelling TCP server handler after failed start: {e}"
+                    )
+                finally:
+                    self.tcp_server_handler = None
+            # Surface a controlled error; upper layer will catch and log
+            raise InvalidSDPRequestError("TCP server failed to start in time")
+
     async def process_sdp_request(
         self, sdp_request: SDPRequest
     ) -> Union[SDPResponse, SDPResponseWireless]:
@@ -404,11 +437,15 @@ class CommunicationSessionHandler:
         else:
             await self.start_tcp_server(False)
 
+        # At this point the TCP server must be up, otherwise start_tcp_server
+        # would have raised. Proceed to craft the response.
         port = self.tcp_server.port
+        ipv6_host = getattr(self.tcp_server, "ipv6_address_host", None)
+        if not ipv6_host:
+            # Extra guard – should not happen
+            raise InvalidSDPRequestError("TCP server address not available")
         # convert IPv6 address from presentation to numeric format
-        ipv6_bytes = socket.inet_pton(
-            socket.AF_INET6, self.tcp_server.ipv6_address_host
-        )
+        ipv6_bytes = socket.inet_pton(socket.AF_INET6, ipv6_host)
 
         return create_sdp_response(
             sdp_request, ipv6_bytes, port, self.tcp_server.is_tls_enabled

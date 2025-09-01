@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import logging
 import socket
 from typing import Optional, Tuple
@@ -6,6 +7,7 @@ from typing import Optional, Tuple
 from iso15118.shared.network import get_link_local_full_addr, get_tcp_port
 from iso15118.shared.notifications import TCPClientNotification
 from iso15118.shared.security import get_ssl_context
+from iso15118.secc.secc_settings import Config
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +23,16 @@ class TCPServer(asyncio.Protocol):
     # (host, port, flowinfo, scope_id)
     ipv6_address_host: str
 
-    def __init__(self, session_handler_queue: asyncio.Queue, iface: str) -> None:
+    def __init__(
+        self, session_handler_queue: asyncio.Queue, iface: str, config: Optional[Config] = None
+    ) -> None:
         self._session_handler_queue: asyncio.Queue = session_handler_queue
         # The dynamic TCP port number in the range of (49152-65535)
         self.port: int = get_tcp_port()
         self.iface: str = iface
         self.server: Optional[asyncio.Server] = None
         self.is_tls_enabled: bool = False
+        self._config = config
 
     async def start_tls(self, ready_event: asyncio.Event):
         """
@@ -84,8 +89,12 @@ class TCPServer(asyncio.Protocol):
                     "SSL context not created. Falling back to TCP connection."
                 )
 
-        MAX_RETRIES: int = 3
-        BACK_OFF_SECONDS: float = 0.5
+        MAX_RETRIES: int = (
+            (self._config.tcp_bind_max_retries if self._config else None) or 3
+        )
+        BACK_OFF_SECONDS: float = (
+            (self._config.tcp_bind_backoff_s if self._config else None) or 0.5
+        )
         # Note: When the socket is being created inside a container,
         # sometimes the network interface is not ready yet and the binding
         # process fails the first time.
@@ -103,21 +112,68 @@ class TCPServer(asyncio.Protocol):
                 self.port, self.iface
             )
             self.ipv6_address_host = self.full_ipv6_address[0]
+            scope_id = self.full_ipv6_address[3]
+            logger.debug(
+                "TCP bind resolve: host=%s scope_id=%s port=%s iface=%s",
+                self.ipv6_address_host,
+                scope_id,
+                self.port,
+                self.iface,
+            )
 
             # Bind the socket to the IP address and port for receiving
             # TCP packets
             try:
+                logger.debug(
+                    "TCP bind attempt %s/%s on %s%%%s:%s",
+                    i + 1,
+                    MAX_RETRIES,
+                    self.ipv6_address_host,
+                    self.iface,
+                    self.port,
+                )
                 sock.bind(self.full_ipv6_address)
+                logger.info(
+                    "TCP bind succeeded on %s%%%s:%s",
+                    self.ipv6_address_host,
+                    self.iface,
+                    self.port,
+                )
                 break
             except OSError as e:
                 # Once the max amount of retries has been reached, reraise the exception
                 if i == MAX_RETRIES - 1:
-                    logger.error(f"{e} on {server_type} server.")
+                    try:
+                        err_name = errno.errorcode.get(getattr(e, "errno", -1), "?")
+                    except Exception:
+                        err_name = "?"
+                    logger.error(
+                        "%s on %s server (errno=%s) while binding %s%%%s:%s",
+                        e,
+                        server_type,
+                        err_name,
+                        self.ipv6_address_host,
+                        self.iface,
+                        self.port,
+                    )
                     raise e
                 else:
-                    logger.warning(f"{e} on {server_type} server. Refreshing port...")
+                    try:
+                        err_name = errno.errorcode.get(getattr(e, "errno", -1), "?")
+                    except Exception:
+                        err_name = "?"
+                    logger.warning(
+                        "%s on %s server (errno=%s) while binding %s%%%s:%s. Refreshing port...",
+                        e,
+                        server_type,
+                        err_name,
+                        self.ipv6_address_host,
+                        self.iface,
+                        self.port,
+                    )
+                    old_port = self.port
                     self._refresh_port()
-                    logger.debug(f"Retrying on {self.port}")
+                    logger.debug("Retrying bind on new port %s (was %s)", self.port, old_port)
                     await asyncio.sleep(BACK_OFF_SECONDS)
                     continue
 
@@ -172,6 +228,7 @@ class TCPServer(asyncio.Protocol):
 
     def _refresh_port(self):
         random_port = get_tcp_port()
-        while random_port != self.port:
+        # Ensure we actually pick a new port different from the current one
+        while random_port == self.port:
             random_port = get_tcp_port()
         self.port = random_port

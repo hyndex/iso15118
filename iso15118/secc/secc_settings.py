@@ -38,6 +38,10 @@ class Config:
         "PNC",
     ]
     env_dump: Optional[dict] = None
+    # Server startup and TCP bind tuning
+    server_start_timeout_s: float = 10.0
+    tcp_bind_max_retries: int = 3
+    tcp_bind_backoff_s: float = 0.5
 
     def load_envs(self, env_path: Optional[str] = None) -> None:
         """
@@ -103,6 +107,16 @@ class Config:
         # enum values in PowerDeliveryReq's ChargeProgress field). In Standby, the
         # EV can still use value-added services while not consuming any power.
         self.standby_allowed = env.bool("STANDBY_ALLOWED", default=False)
+        # Startup timeout and TCP bind retry/backoff tuning
+        self.server_start_timeout_s = env.float(
+            "SECC_SERVER_START_TIMEOUT_S", default=10.0
+        )
+        self.tcp_bind_max_retries = env.int(
+            "SECC_TCP_BIND_MAX_RETRIES", default=3
+        )
+        self.tcp_bind_backoff_s = env.float(
+            "SECC_TCP_BIND_BACKOFF_S", default=0.5
+        )
         load_shared_settings(env_path)
         env.seal()  # raise all errors at once, if any
         self.env_dump = dict(env.dump())
