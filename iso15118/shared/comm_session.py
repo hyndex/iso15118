@@ -49,7 +49,10 @@ from iso15118.shared.messages.iso15118_20.common_messages import (
 from iso15118.shared.messages.iso15118_20.common_types import (
     V2GMessage as V2GMessageV20,
 )
+import os
+import time
 from iso15118.shared.messages.v2gtp import V2GTPMessage
+from iso15118.shared.settings import shared_settings, SettingKey
 from iso15118.shared.notifications import StopNotification
 from iso15118.shared.states import Pause, State, Terminate
 from iso15118.shared.utils import wait_for_tasks
@@ -340,6 +343,18 @@ class V2GCommunicationSession(SessionStateMachine):
         self.stop_reason: Optional[StopNotification] = None
         self.last_message_sent: Optional[V2GTPMessage] = None
         self._started: bool = True
+        # EXI per-session capture
+        self._exi_seq: int = 0
+        self._exi_dir: Optional[str] = None
+        if shared_settings.get(SettingKey.MESSAGE_LOG_PER_SESSION):
+            base = shared_settings.get(SettingKey.EXI_SESSION_DIR)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            peer = f"{self.peer_name[0]}_{self.peer_name[1]}" if isinstance(self.peer_name, tuple) else str(self.peer_name)
+            self._exi_dir = os.path.join(str(base), f"session_{ts}_{peer}")
+            try:
+                os.makedirs(self._exi_dir, exist_ok=True)
+            except Exception:
+                self._exi_dir = None
 
         logger.info("Starting a new communication session")
         SessionStateMachine.__init__(self, start_state, comm_session)
@@ -425,10 +440,19 @@ class V2GCommunicationSession(SessionStateMachine):
         """
 
         # TODO: we may also check for writer exceptions
-        self.writer.write(message.to_bytes())
+        raw = message.to_bytes()
+        self.writer.write(raw)
         await self.writer.drain()
         self.last_message_sent = message
         logger.info(f"Sent {str(self.current_state.message)}")
+        # Save EXI if configured
+        try:
+            if self._exi_dir:
+                self._exi_seq += 1
+                with open(os.path.join(self._exi_dir, f"{self._exi_seq:04d}_tx_{int(time.time()*1000)}.exi"), "wb") as f:
+                    f.write(raw)
+        except Exception:
+            pass
 
     async def rcv_loop(self, timeout: float):
         """
@@ -447,10 +471,20 @@ class V2GCommunicationSession(SessionStateMachine):
         """
         while True:
             try:
-                # The biggest message is the Certificate Installation Response,
-                # which is estimated to be maximum between 5k to 6k
-                # TODO check if that still holds with -20 (e.g. cross certs)
-                message = await asyncio.wait_for(self.reader.read(7000), timeout)
+                # Robust V2GTP reassembly: read header (8 bytes) then payload
+                header = await asyncio.wait_for(self.reader.readexactly(8), timeout)
+                # Validate and extract payload length
+                if not V2GTPMessage.is_header_valid(self.comm_session.protocol, header):
+                    raise InvalidV2GTPMessageError("Invalid V2GTP header")
+                payload_len = V2GTPMessage.get_payload_length(header)
+                if payload_len < 0:
+                    raise InvalidV2GTPMessageError("Negative payload length")
+                payload = b""
+                if payload_len:
+                    payload = await asyncio.wait_for(
+                        self.reader.readexactly(payload_len), timeout
+                    )
+                message = header + payload
                 if message == b"" and self.reader.at_eof():
                     stop_reason: str = "TCP peer closed connection"
                     await self.stop(reason=stop_reason)
@@ -491,11 +525,28 @@ class V2GCommunicationSession(SessionStateMachine):
                     gc.disable()
                 # This will create the values needed for the next state, such as
                 # next_state, next_v2gtp_message, next_message_payload_type etc.
+                # Save RX EXI if configured
+                try:
+                    if self._exi_dir:
+                        self._exi_seq += 1
+                        with open(os.path.join(self._exi_dir, f"{self._exi_seq:04d}_rx_{int(time.time()*1000)}.exi"), "wb") as f:
+                            f.write(message)
+                except Exception:
+                    pass
+                t0 = time.time()
                 await self.process_message(message)
                 if self.current_state.next_v2gtp_msg:
                     # next_v2gtp_msg would not be set only if the next state is either
                     # Terminate or Pause on the EVCC side
                     await self.send(self.current_state.next_v2gtp_msg)
+                t1 = time.time()
+                try:
+                    if (t1 - t0) > 0.5:
+                        logger.warning(
+                            "Charge-loop processing latency high: %.0f ms", (t1 - t0) * 1000
+                        )
+                except Exception:
+                    pass
                     await self._update_state_info(self.current_state)
 
                 if self.current_state.next_state in (Terminate, Pause):

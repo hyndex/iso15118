@@ -42,6 +42,8 @@ class Config:
     server_start_timeout_s: float = 10.0
     tcp_bind_max_retries: int = 3
     tcp_bind_backoff_s: float = 0.5
+    # Min interval between SDP responses (ms) to avoid flooding
+    sdp_min_interval_ms: int = 100
 
     def load_envs(self, env_path: Optional[str] = None) -> None:
         """
@@ -116,6 +118,10 @@ class Config:
         )
         self.tcp_bind_backoff_s = env.float(
             "SECC_TCP_BIND_BACKOFF_S", default=0.5
+        )
+        # Throttle repeated SDP responses
+        self.sdp_min_interval_ms = env.int(
+            "SECC_SDP_MIN_INTERVAL_MS", default=100
         )
         load_shared_settings(env_path)
         env.seal()  # raise all errors at once, if any

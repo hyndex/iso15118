@@ -204,6 +204,8 @@ class CommunicationSessionHandler:
         self.comm_sessions: Dict[str, Tuple[SECCCommunicationSession, asyncio.Task]] = (
             {}
         )
+        # SDP response rate limiting
+        self._last_sdp_sent_mono: float = 0.0
 
     async def start_session_handler(
         self, iface: str, start_udp_server: Optional[bool] = True
@@ -499,6 +501,15 @@ class CommunicationSessionHandler:
                 ISOV2PayloadTypes.SDP_RESPONSE,
                 sdp_response.to_payload(),
             )
+            # Throttle SDP responses if configured
+            try:
+                min_interval = getattr(self.config, "sdp_min_interval_ms", 100) / 1000.0
+            except Exception:
+                min_interval = 0.1
+            now = asyncio.get_event_loop().time()
+            delay = (self._last_sdp_sent_mono + min_interval) - now
+            if delay > 0:
+                await asyncio.sleep(delay)
             logger.info(f"Sending SDPResponse: {sdp_response}")
-
             self.udp_server.send(v2gtp_msg, message.addr)
+            self._last_sdp_sent_mono = asyncio.get_event_loop().time()

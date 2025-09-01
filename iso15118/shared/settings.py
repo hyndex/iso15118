@@ -9,6 +9,8 @@ class SettingKey:
     MESSAGE_LOG_JSON = "MESSAGE_LOG_JSON"
     MESSAGE_LOG_EXI = "MESSAGE_LOG_EXI"
     ENABLE_TLS_1_3 = "ENABLE_TLS_1_3"
+    EXI_SESSION_DIR = "EXI_SESSION_DIR"
+    MESSAGE_LOG_PER_SESSION = "MESSAGE_LOG_PER_SESSION"
 
 
 shared_settings = {}
@@ -27,6 +29,8 @@ def load_shared_settings(env_path: Optional[str] = None):
         SettingKey.MESSAGE_LOG_JSON: env.bool("MESSAGE_LOG_JSON", default=True),
         SettingKey.MESSAGE_LOG_EXI: env.bool("MESSAGE_LOG_EXI", default=False),
         SettingKey.ENABLE_TLS_1_3: env.bool("ENABLE_TLS_1_3", default=False),
+        SettingKey.EXI_SESSION_DIR: env.str("EXI_SESSION_DIR", default=os.path.join(WORK_DIR, "exi_sessions")),
+        SettingKey.MESSAGE_LOG_PER_SESSION: env.bool("MESSAGE_LOG_PER_SESSION", default=False),
     }
     shared_settings.update(settings)
     env.seal()  # raise all errors at once, if any
