@@ -56,6 +56,7 @@ from iso15118.shared.settings import shared_settings, SettingKey
 from iso15118.shared.notifications import StopNotification
 from iso15118.shared.states import Pause, State, Terminate
 from iso15118.shared.utils import wait_for_tasks
+from iso15118.shared.messages.timeouts import Timeouts as TShared
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +360,62 @@ class V2GCommunicationSession(SessionStateMachine):
         logger.info("Starting a new communication session")
         SessionStateMachine.__init__(self, start_state, comm_session)
 
+        # Timeout override caps (env-driven). 0 disables.
+        # V2G_TIMEOUT_MIN_S: minimum allowed per-step timeout (floats)
+        # V2G_TIMEOUT_MAX_S: maximum allowed per-step timeout
+        # V2G_SECC_SEQUENCE_TIMEOUT_CAP_S: cap when sequence timeout (default 60s) is used
+        # V2G_EVCC_COMM_SETUP_TIMEOUT_CAP_S: cap when comm setup timeout (default 20s) is used
+        import os
+
+        def _f(name: str, default: float = 0.0) -> float:
+            try:
+                v = os.environ.get(name)
+                return float(v) if v is not None and v != "" else default
+            except Exception:
+                return default
+
+        self._to_min_s: float = _f("V2G_TIMEOUT_MIN_S", 0.0)
+        self._to_max_s: float = _f("V2G_TIMEOUT_MAX_S", 0.0)
+        self._cap_seq_s: float = _f("V2G_SECC_SEQUENCE_TIMEOUT_CAP_S", 0.0)
+        self._cap_comm_setup_s: float = _f("V2G_EVCC_COMM_SETUP_TIMEOUT_CAP_S", 0.0)
+        # One-shot grace extension when CP indicates physical link is still connected
+        self._grace_s: float = _f("V2G_TIMEOUT_GRACE_S", 0.0)
+        try:
+            self._grace_remaining: int = int(os.environ.get("V2G_TIMEOUT_GRACE_MAX", "1"))
+        except Exception:
+            self._grace_remaining = 1
+
+    def _effective_timeout(self, timeout: float) -> float:
+        """Apply environment-driven caps to the given timeout value.
+
+        Ensures per-message timeouts adhere to optional min/max and specific caps
+        for well-known phases without changing call sites across the codebase.
+        """
+        eff = float(timeout or 0)
+        # Specific caps when the default sequence or communication setup timeouts are used
+        try:
+            if self._cap_seq_s > 0 and eff >= float(TShared.V2G_SECC_SEQUENCE_TIMEOUT):
+                eff = min(eff, self._cap_seq_s)
+        except Exception:
+            pass
+        try:
+            if self._cap_comm_setup_s > 0 and eff >= float(TShared.V2G_EVCC_COMMUNICATION_SETUP_TIMEOUT):
+                eff = min(eff, self._cap_comm_setup_s)
+        except Exception:
+            pass
+        # Global caps
+        if self._to_max_s > 0:
+            eff = min(eff, self._to_max_s)
+        if self._to_min_s > 0:
+            eff = max(eff, self._to_min_s)
+        # Floor to a small positive value to avoid zero/negative waits
+        try:
+            if eff <= 0:
+                eff = 0.01
+        except Exception:
+            eff = 0.01
+        return eff
+
     async def start(self, timeout: float):
         """
         Starts a EVCC / SECC communication session by spawning up the rcv_loop()
@@ -471,8 +528,9 @@ class V2GCommunicationSession(SessionStateMachine):
         """
         while True:
             try:
+                eff_timeout = self._effective_timeout(timeout)
                 # Robust V2GTP reassembly: read header (8 bytes) then payload
-                header = await asyncio.wait_for(self.reader.readexactly(8), timeout)
+                header = await asyncio.wait_for(self.reader.readexactly(8), eff_timeout)
                 # Validate and extract payload length
                 if not V2GTPMessage.is_header_valid(self.comm_session.protocol, header):
                     raise InvalidV2GTPMessageError("Invalid V2GTP header")
@@ -482,7 +540,7 @@ class V2GCommunicationSession(SessionStateMachine):
                 payload = b""
                 if payload_len:
                     payload = await asyncio.wait_for(
-                        self.reader.readexactly(payload_len), timeout
+                        self.reader.readexactly(payload_len), eff_timeout
                     )
                 message = header + payload
                 if message == b"" and self.reader.at_eof():
@@ -497,6 +555,33 @@ class V2GCommunicationSession(SessionStateMachine):
                     )
                     return
             except (asyncio.TimeoutError, ConnectionResetError) as exc:
+                # Optional grace extension: if we timed out but CP is still connected,
+                # allow one more short wait to accommodate slower counterparts.
+                if isinstance(exc, asyncio.TimeoutError):
+                    try:
+                        if (
+                            self._grace_s > 0
+                            and self._grace_remaining > 0
+                            and hasattr(self.comm_session, "evse_controller")
+                        ):
+                            from iso15118.shared.messages.enums import CpState  # lazy import
+
+                            evse_controller = self.comm_session.evse_controller  # type: ignore[attr-defined]
+                            cp = await evse_controller.get_cp_state()
+                            # Treat non-disconnected states as connected
+                            if cp not in (CpState.A1, CpState.A2, CpState.E, CpState.F, CpState.UNKNOWN):
+                                self._grace_remaining -= 1
+                                logger.warning(
+                                    "RX timeout; applying one-shot grace of %.3fs (remaining=%d)",
+                                    self._grace_s,
+                                    self._grace_remaining,
+                                )
+                                timeout = self._grace_s
+                                # Restart the loop with updated timeout
+                                continue
+                    except Exception:
+                        # Fall through to normal timeout handling
+                        pass
                 if type(exc) is asyncio.TimeoutError:
                     if self.last_message_sent:
                         error_msg = (
