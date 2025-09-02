@@ -2514,10 +2514,19 @@ class CurrentDemand(StateSECC):
             # MeteringReceiptReq
             next_state = MeteringReceipt
 
+        # Apply a tighter watchdog during CurrentDemand if configured
+        try:
+            cd_timeout = float(getattr(self.comm_session.config, "current_demand_timeout_s", 0.0) or 0.0)
+        except Exception:
+            cd_timeout = 0.0
+        effective_timeout = (
+            cd_timeout if cd_timeout and cd_timeout > 0 else Timeouts.V2G_SECC_SEQUENCE_TIMEOUT
+        )
+
         self.create_next_message(
             next_state,
             current_demand_res,
-            Timeouts.V2G_SECC_SEQUENCE_TIMEOUT,
+            effective_timeout,
             Namespace.ISO_V2_MSG_DEF,
         )
 

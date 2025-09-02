@@ -44,6 +44,14 @@ class Config:
     tcp_bind_backoff_s: float = 0.5
     # Min interval between SDP responses (ms) to avoid flooding
     sdp_min_interval_ms: int = 100
+    # Watchdog for non-responsive EV during CurrentDemand loop (seconds).
+    # 0 or negative disables and falls back to sequence timeout.
+    current_demand_timeout_s: float = 0.0
+
+    # Safety: on CP disconnect, immediately open contactor before any grace
+    # delay used for higher-level shutdown (seconds). Default 0.1s to align
+    # with 100 ms requirement. Set to 0 to disable host-enforced immediate cut.
+    cp_disconnect_immediate_cutoff_s: float = 0.1
 
     def load_envs(self, env_path: Optional[str] = None) -> None:
         """
@@ -122,6 +130,14 @@ class Config:
         # Throttle repeated SDP responses
         self.sdp_min_interval_ms = env.int(
             "SECC_SDP_MIN_INTERVAL_MS", default=100
+        )
+        # CurrentDemand watchdog
+        self.current_demand_timeout_s = env.float(
+            "SECC_CURRENT_DEMAND_TIMEOUT_S", default=0.0
+        )
+        # Immediate contactor open on CP disconnect (host side)
+        self.cp_disconnect_immediate_cutoff_s = env.float(
+            "SECC_CP_DISCONNECT_IMMEDIATE_CUTOFF_S", default=0.1
         )
         load_shared_settings(env_path)
         env.seal()  # raise all errors at once, if any

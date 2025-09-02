@@ -1,6 +1,7 @@
 import json
 import logging
 from base64 import b64decode, b64encode
+import os
 from typing import Optional, Type, Union
 
 from pydantic import ValidationError
@@ -281,6 +282,16 @@ class EXI:
         Raises:
             EXIDecodingError
         """
+        # Guardrail: cap raw EXI size to avoid resource abuse (0 disables)
+        try:
+            max_exi = int(os.environ.get("V2G_MAX_EXI_BYTES", "262144"))
+        except Exception:
+            max_exi = 262144
+        if max_exi > 0 and len(exi_message or b"") > max_exi:
+            raise EXIDecodingError(
+                f"EXIDecodingError (TooLarge): EXI payload {len(exi_message)} bytes exceeds cap {max_exi}"
+            )
+
         if shared_settings[SettingKey.MESSAGE_LOG_EXI]:
             logger.debug(f"EXI-encoded message (ns={namespace}): {exi_message.hex()}")
 
@@ -290,12 +301,23 @@ class EXI:
             raise EXIDecodingError(
                 f"EXIDecodingError ({exc.__class__.__name__}): " f"{exc}"
             ) from exc
+        # Guardrail: cap decoded JSON text length (0 disables)
+        try:
+            max_json = int(os.environ.get("V2G_MAX_EXI_JSON_BYTES", "1048576"))
+        except Exception:
+            max_json = 1048576
+        if max_json > 0 and len(exi_decoded or "") > max_json:
+            raise EXIDecodingError(
+                f"EXIDecodingError (TooLarge): Decoded EXI JSON {len(exi_decoded)} bytes exceeds cap {max_json}"
+            )
+
         try:
             decoded_dict = json.loads(exi_decoded, cls=CustomJSONDecoder)
-        except json.JSONDecodeError as exc:
+        except Exception as exc:
+            # Convert any decoding/object_hook errors into EXIDecodingError so upper layer can
+            # apply tolerant handling instead of treating as an unexpected exception.
             raise EXIDecodingError(
-                f"JSON decoding error ({exc.__class__.__name__}) while "
-                f"processing decoded EXI: {exc}"
+                f"JSON decoding error ({exc.__class__.__name__}) while processing decoded EXI: {exc}"
             ) from exc
 
         if shared_settings[SettingKey.MESSAGE_LOG_JSON]:

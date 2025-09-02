@@ -8,6 +8,7 @@ receiving, and processing messages during an ISO 15118 communication session.
 import asyncio
 import gc
 import logging
+import json
 from abc import ABC, abstractmethod
 from asyncio.streams import StreamReader, StreamWriter
 from typing import List, Optional, Tuple, Type, Union
@@ -51,6 +52,8 @@ from iso15118.shared.messages.iso15118_20.common_types import (
 )
 import os
 import time
+import hashlib
+import random
 from iso15118.shared.messages.v2gtp import V2GTPMessage
 from iso15118.shared.settings import shared_settings, SettingKey
 from iso15118.shared.notifications import StopNotification
@@ -189,7 +192,22 @@ class SessionStateMachine(ABC):
             v2gtp_msg = V2GTPMessage.from_bytes(self.comm_session.protocol, message)
         except InvalidV2GTPMessageError as exc:
             logger.exception("Incoming TCPPacket is not a valid V2GTPMessage")
+            try:
+                self._rx_invalid_v2gtp_count += 1
+            except Exception:
+                pass
             raise exc
+
+        # Detect byte-identical duplicate requests within a short window
+        # and resend the last response if available, without advancing state.
+        try:
+            if self._is_duplicate_and_can_resend(v2gtp_msg.payload):
+                if self.last_message_sent is not None:
+                    await self.send(self.last_message_sent)
+                    return
+        except Exception:
+            # Fall back to normal processing on any error
+            pass
 
         # Step 2
         decoded_message: Union[
@@ -237,7 +255,17 @@ class SessionStateMachine(ABC):
         # Step 3
         try:
             logger.info(f"{str(decoded_message)} received")
+            # Track last received message name for richer timeout diagnostics
+            try:
+                self._last_rx_name = type(decoded_message).__name__  # type: ignore[attr-defined]
+            except Exception:
+                pass
             await self.current_state.process_message(decoded_message, v2gtp_msg.payload)
+            # Update duplicate fingerprint after successful processing
+            try:
+                self._mark_new_request_fingerprint(v2gtp_msg.payload)
+            except Exception:
+                pass
         except MessageProcessingError as exc:
             logger.exception(
                 f"{exc.__class__.__name__} while processing " f"{exc.message_name}"
@@ -275,6 +303,41 @@ class SessionStateMachine(ABC):
         """
         if self.current_state.next_state:
             self.current_state.next_state(self.comm_session)
+
+    def _is_duplicate_and_can_resend(self, payload: bytes) -> bool:
+        """Detect duplicate RX payload and decide whether to resend last response.
+
+        Uses a short time window and max resend count to avoid loops.
+        """
+        if not getattr(self, "_dup_resend_enabled", True):
+            return False
+        try:
+            h = hashlib.sha256(payload).hexdigest()
+        except Exception:
+            return False
+        now = asyncio.get_event_loop().time()
+        if self._rx_last_payload_sha and h == self._rx_last_payload_sha:
+            within = (now - self._rx_last_time_mono) <= max(0.1, float(self._dup_resend_window_s))
+            if (
+                within
+                and self.last_message_sent is not None
+                and self._rx_dup_resent_count < max(0, int(self._dup_resend_max))
+            ):
+                self._rx_dup_resent_count += 1
+                logger.warning(
+                    "Duplicate request detected (hash=%s) within %.1fs; resending last response #%d",
+                    h[:10], self._dup_resend_window_s, self._rx_dup_resent_count,
+                )
+                return True
+        return False
+
+    def _mark_new_request_fingerprint(self, payload: bytes) -> None:
+        try:
+            self._rx_last_payload_sha = hashlib.sha256(payload).hexdigest()
+            self._rx_last_time_mono = asyncio.get_event_loop().time()
+            self._rx_dup_resent_count = 0
+        except Exception:
+            pass
 
     def resume(self):
         logger.debug("Trying to resume communication session")
@@ -385,6 +448,42 @@ class V2GCommunicationSession(SessionStateMachine):
         except Exception:
             self._grace_remaining = 1
 
+        # Robustness controls (env-driven)
+        try:
+            self._dup_resend_enabled: bool = os.environ.get("V2G_DUPLICATE_RESEND_ENABLED", "1") not in ("0", "false", "False")
+        except Exception:
+            self._dup_resend_enabled = True
+        try:
+            self._dup_resend_window_s: float = float(os.environ.get("V2G_DUPLICATE_RESEND_WINDOW_S", "2.0"))
+        except Exception:
+            self._dup_resend_window_s = 2.0
+        try:
+            self._dup_resend_max: int = int(os.environ.get("V2G_DUPLICATE_RESEND_MAX", "3"))
+        except Exception:
+            self._dup_resend_max = 3
+        try:
+            self._max_decode_errors: int = int(os.environ.get("V2G_MAX_DECODE_ERRORS", "2"))
+        except Exception:
+            self._max_decode_errors = 2
+        try:
+            self._tx_drop_prob: float = float(os.environ.get("V2G_DROP_TX_PROB", "0.0"))
+        except Exception:
+            self._tx_drop_prob = 0.0
+
+        # Runtime counters and last-RX fingerprint for duplicate detection
+        self._rx_last_payload_sha: Optional[str] = None
+        self._rx_last_time_mono: float = 0.0
+        self._rx_dup_resent_count: int = 0
+        self._rx_decode_error_count: int = 0
+        self._rx_validation_error_count: int = 0
+        self._rx_invalid_v2gtp_count: int = 0
+        self._last_rx_name: Optional[str] = None
+        # Telemetry sink (optional UDP JSON "host:port")
+        try:
+            self._metrics_udp: Optional[str] = os.environ.get("V2G_METRICS_UDP") or None
+        except Exception:
+            self._metrics_udp = None
+
     def _effective_timeout(self, timeout: float) -> float:
         """Apply environment-driven caps to the given timeout value.
 
@@ -470,6 +569,12 @@ class V2GCommunicationSession(SessionStateMachine):
         )
         logger.info(f"Reason: {reason}")
 
+        # Emit session metrics before tearing down link
+        try:
+            self._emit_session_metrics(reason)
+        except Exception:
+            pass
+
         await asyncio.sleep(2)
         # Signal data link layer to either terminate or pause the data
         # link connection
@@ -488,6 +593,51 @@ class V2GCommunicationSession(SessionStateMachine):
             logger.info(str(exc))
         logger.info("TCP connection closed to peer with address " f"{self.peer_name}")
 
+    def _emit_session_metrics(self, reason: str) -> None:
+        """Emit a single JSON line with session counters and state.
+
+        Optionally send to UDP sink specified via V2G_METRICS_UDP ("host:port").
+        """
+        try:
+            peer = self.peer_name if isinstance(self.peer_name, str) else str(self.peer_name)
+        except Exception:
+            peer = None
+        try:
+            proto = getattr(self.protocol, "name", str(self.protocol))
+        except Exception:
+            proto = None
+        payload = {
+            "type": "v2g_session_metrics",
+            "session_id": self.session_id or None,
+            "peer": peer,
+            "protocol": proto,
+            "successful": bool(self.stop_reason.successful) if self.stop_reason else None,
+            "reason": reason,
+            "rx_decode_errors": self._rx_decode_error_count,
+            "rx_validation_errors": self._rx_validation_error_count,
+            "rx_invalid_v2gtp": self._rx_invalid_v2gtp_count,
+            "dup_resent_count": self._rx_dup_resent_count,
+            "dup_resend_enabled": self._dup_resend_enabled,
+            "dup_window_s": self._dup_resend_window_s,
+            "dup_resend_max": self._dup_resend_max,
+            "tx_drop_prob": self._tx_drop_prob,
+        }
+        try:
+            logger.info("v2g_metrics: %s", json.dumps(payload))
+        except Exception:
+            pass
+        if self._metrics_udp:
+            try:
+                import socket
+                host, port_s = self._metrics_udp.rsplit(":", 1)
+                port = int(port_s)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(0.02)
+                sock.sendto(json.dumps(payload).encode("utf-8"), (host, port))
+                sock.close()
+            except Exception:
+                pass
+
     async def send(self, message: V2GTPMessage):
         """
         Sends a V2GTPMessage via the TCP socket and stores the last message sent
@@ -495,6 +645,18 @@ class V2GCommunicationSession(SessionStateMachine):
         Args:
             message: A V2GTPMessage
         """
+
+        # Optional simulation: probabilistic TX drop for robustness testing
+        try:
+            if self._tx_drop_prob > 0.0 and random.random() < self._tx_drop_prob:
+                logger.warning(
+                    "Simulated TX drop of %s for robustness test", str(self.current_state.message)
+                )
+                # Still remember last message so duplicates can trigger resend
+                self.last_message_sent = message
+                return
+        except Exception:
+            pass
 
         # TODO: we may also check for writer exceptions
         raw = message.to_bytes()
@@ -583,18 +745,22 @@ class V2GCommunicationSession(SessionStateMachine):
                         # Fall through to normal timeout handling
                         pass
                 if type(exc) is asyncio.TimeoutError:
+                    # Enrich timeout diagnostics with stage and last RX/TX context
+                    stage = None
+                    try:
+                        stage = type(self.current_state).__name__
+                    except Exception:
+                        stage = None
+                    last_rx = getattr(self, "_last_rx_name", None)
                     if self.last_message_sent:
                         error_msg = (
-                            f"{exc.__class__.__name__} occurred. Waited "
-                            f"for {timeout} s after sending last message: "
-                            f"{str(self.last_message_sent)}"
+                            f"EV not responding: waited {timeout} s in stage={stage} "
+                            f"after TX={str(self.last_message_sent)}; last_rx={last_rx}"
                         )
                     else:
                         error_msg = (
-                            f"{exc.__class__.__name__} occurred. Waited "
-                            f"for {timeout} s. No V2GTP message was "
-                            "previously sent. This is probably a timeout "
-                            f"while waiting for SupportedAppProtocolReq"
+                            f"EV not responding: waited {timeout} s in stage={stage}; "
+                            f"last_rx={last_rx or 'None'} (likely awaiting SupportedAppProtocolReq)"
                         )
                 else:
                     error_msg = f"{exc.__class__.__name__} occurred. {str(exc)}"
@@ -653,6 +819,26 @@ class V2GCommunicationSession(SessionStateMachine):
                 ConnectionResetError,
                 Exception,
             ) as exc:
+                # Tolerate a limited number of decode/validation errors by discarding
+                # the bad frame and waiting for the next one to aid resync.
+                from iso15118.shared.exceptions import V2GMessageValidationError as _VVal
+                if isinstance(exc, (EXIDecodingError, _VVal)):
+                    if isinstance(exc, EXIDecodingError):
+                        self._rx_decode_error_count += 1
+                        cnt = self._rx_decode_error_count
+                        kind = "EXI decode"
+                    else:
+                        self._rx_validation_error_count += 1
+                        cnt = self._rx_validation_error_count
+                        kind = "message validation"
+                    if cnt <= max(0, int(self._max_decode_errors)):
+                        logger.warning(
+                            "%s error #%d tolerated; discarding frame and waiting for next",
+                            kind,
+                            cnt,
+                        )
+                        # Continue receiving without tearing down the session
+                        continue
                 message_name = ""
                 additional_info = ""
                 if isinstance(exc, MessageProcessingError):
