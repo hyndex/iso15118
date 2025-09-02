@@ -69,6 +69,11 @@ class Config:
     mismatch_abort_s: float = 2.0
     # Below this current, skip current mismatch checks to avoid noise
     min_current_for_check_a: float = 2.0
+    # Post-Stop graceful shutdown: wait for EV to open its HV contactor
+    # (inferred by near-zero current or CP leaving C/D) before opening EVSE
+    # contactor. If timeout elapses, escalate to emergency shutdown.
+    post_stop_ev_open_wait_s: float = 1.0
+    post_stop_current_threshold_a: float = 1.0
 
     def load_envs(self, env_path: Optional[str] = None) -> None:
         """
@@ -181,6 +186,13 @@ class Config:
         )
         self.min_current_for_check_a = env.float(
             "SECC_MIN_CURRENT_FOR_CHECK_A", default=2.0
+        )
+        # Post-Stop graceful shutdown tuning
+        self.post_stop_ev_open_wait_s = env.float(
+            "SECC_POST_STOP_EV_OPEN_WAIT_S", default=1.0
+        )
+        self.post_stop_current_threshold_a = env.float(
+            "SECC_POST_STOP_CURRENT_THRESHOLD_A", default=1.0
         )
         load_shared_settings(env_path)
         env.seal()  # raise all errors at once, if any

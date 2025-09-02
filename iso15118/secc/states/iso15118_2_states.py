@@ -1731,12 +1731,60 @@ class PowerDelivery(StateSECC):
             # contactor as for every effect, the session will be stopped.
             await self.comm_session.evse_controller.set_hlc_charging(False)
 
-            # 1st a controlled stop is performed (specially important for DC charging)
-            # later on we may also need here some feedback on stopping the charger
-            await self.comm_session.evse_controller.stop_charger()
-            # 2nd once the energy transfer is properly interrupted,
-            # the contactor(s) may open
+            # Graceful stop for DC: request near-zero current and allow the EV
+            # to open its contactor before we open ours. If timeout elapses,
+            # proceed with emergency stop.
+            try:
+                evdc = self.comm_session.evse_controller.ev_data_context
+                # Send a last low-current command (0 A) to reduce load
+                try:
+                    await self.comm_session.evse_controller.send_charging_command(
+                        ev_target_voltage=evdc.target_voltage or evdc.present_voltage,
+                        ev_target_current=0.0,
+                    )
+                except Exception:
+                    pass
+                # Wait for current to decay or CP to leave C/D
+                wait_s = float(
+                    getattr(self.comm_session.config, "post_stop_ev_open_wait_s", 1.0)
+                    or 0.0
+                )
+                thr_a = float(
+                    getattr(
+                        self.comm_session.config,
+                        "post_stop_current_threshold_a",
+                        1.0,
+                    )
+                    or 0.0
+                )
+                start = time.monotonic()
+                while (time.monotonic() - start) < wait_s:
+                    try:
+                        cp_state = await self.comm_session.evse_controller.get_cp_state()
+                    except Exception:
+                        cp_state = None
+                    if cp_state is not None:
+                        if cp_state not in (CpState.C2, CpState.D2):
+                            break
+                    try:
+                        pv = await self.comm_session.evse_controller.get_evse_present_current(
+                            Protocol.ISO_15118_2
+                        )
+                        cur_a = (
+                            pv.get_decimal_value()
+                            if hasattr(pv, "get_decimal_value")
+                            else float(getattr(self.comm_session.evse_controller.evse_data_context, "present_current", 0.0) or 0.0)
+                        )
+                    except Exception:
+                        cur_a = 0.0
+                    if abs(cur_a) <= thr_a:
+                        break
+                    await asyncio.sleep(0.05)
+            except Exception:
+                pass
 
+            # Controlled stop/open EVSE contactor and pilot fallback
+            await self.comm_session.evse_controller.stop_charger()
             if not await self.comm_session.evse_controller.is_contactor_opened():
                 self.stop_state_machine(
                     "Contactor didnt open",
