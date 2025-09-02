@@ -147,6 +147,22 @@ class _DummyEVSEController(EVSEControllerInterface):
     async def is_evse_power_limit_achieved(self) -> bool:
         return False
 
+    # New abstract API requirements in EVSEControllerInterface
+    async def get_ac_charge_params_v20(self, *args, **kwargs):
+        return None
+
+    async def get_dc_charge_params_v20(self, *args, **kwargs):
+        return None
+
+    async def get_evse_status(self):
+        return None
+
+    async def is_contactor_closed(self) -> bool:
+        return True
+
+    async def is_contactor_opened(self) -> bool:
+        return False
+
 
 async def _start_idle_server(host: str, port: int):
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):

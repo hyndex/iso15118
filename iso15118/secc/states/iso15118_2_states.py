@@ -142,6 +142,7 @@ from iso15118.shared.security import (
     verify_signature,
 )
 from iso15118.shared.states import Base64, Pause, State, Terminate
+from iso15118.secc.quirks import identify_ev_quirks
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,13 @@ class SessionSetup(StateSECC):
         )
 
         self.comm_session.evcc_id = session_setup_req.evcc_id
+        # Identify any EV-specific quirks for this session
+        try:
+            self.comm_session.quirk_profile = identify_ev_quirks(
+                self.comm_session.evcc_id
+            )
+        except Exception as e:
+            logger.warning(f"Quirk identification error: {e}")
         self.comm_session.evse_controller.ev_data_context.evcc_id = (
             session_setup_req.evcc_id
         )
@@ -2487,19 +2495,91 @@ class CurrentDemand(StateSECC):
         ev_data_context = self.comm_session.evse_controller.ev_data_context
         ev_data_context.update_charge_loop_parameters(current_demand_req)
 
-        # Updates the power electronics targets based on EV requests
+        # Heuristic: detect rapid CurrentDemand arrivals and enable async HAL path
+        now_mono = time.monotonic()
+        last = self.comm_session.last_current_demand_mono
+        if last:
+            interval = now_mono - last
+            if interval < 0.05:  # <50 ms considered rapid
+                self.comm_session.diag_counters["rapid_current_demand"] = (
+                    self.comm_session.diag_counters.get("rapid_current_demand", 0) + 1
+                )
+                if (
+                    self.comm_session.diag_counters["rapid_current_demand"] >= 3
+                    and not self.comm_session.quirk_profile.current_demand_async_hal
+                ):
+                    logger.info(
+                        "Enabling async HAL updates due to rapid CurrentDemand cadence"
+                    )
+                    self.comm_session.quirk_profile.current_demand_async_hal = True
+        self.comm_session.last_current_demand_mono = now_mono
+
+        # Range sanity checks: flag if EV requests exceed session/rated limits
         try:
-            await self.comm_session.evse_controller.send_charging_command(
-                ev_data_context.target_voltage,
-                ev_data_context.target_current,
-            )
-        except asyncio.TimeoutError:
-            self.stop_state_machine(
-                "Error sending targets to charging station in charging loop.",
-                message,
-                ResponseCode.FAILED,
-            )
-            return
+            limits = self.comm_session.evse_controller.ev_data_context.session_limits.dc_limits
+            if limits and limits.max_charge_current is not None:
+                if ev_data_context.target_current > (limits.max_charge_current + 0.5):
+                    self.comm_session.diag_counters["req_over_max_current"] = (
+                        self.comm_session.diag_counters.get("req_over_max_current", 0)
+                        + 1
+                    )
+                    logger.warning(
+                        "EV requested current %.2fA exceeding session max %.2fA",
+                        ev_data_context.target_current,
+                        limits.max_charge_current,
+                    )
+            if limits and limits.max_voltage is not None:
+                if ev_data_context.target_voltage > (limits.max_voltage + 2.0):
+                    self.comm_session.diag_counters["req_over_max_voltage"] = (
+                        self.comm_session.diag_counters.get("req_over_max_voltage", 0)
+                        + 1
+                    )
+                    logger.warning(
+                        "EV requested voltage %.2fV exceeding session max %.2fV",
+                        ev_data_context.target_voltage,
+                        limits.max_voltage,
+                    )
+        except Exception:
+            # Never block the loop for missing optional fields
+            pass
+
+        # Updates the power electronics targets based on EV requests
+        if self.comm_session.quirk_profile.current_demand_async_hal:
+            # Fire-and-replace in-flight HAL update, reply without awaiting
+            try:
+                # Cancel any in-flight task to avoid piling up
+                task = self.comm_session.current_demand_hal_task
+                if task and not task.done():
+                    task.cancel()
+                self.comm_session.current_demand_hal_task = asyncio.create_task(
+                    self.comm_session.evse_controller.send_charging_command(
+                        ev_data_context.target_voltage, ev_data_context.target_current
+                    )
+                )
+                # Avoid unhandled task exceptions
+                def _cd_done_cb(t: asyncio.Task):
+                    try:
+                        _ = t.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"Async HAL command failed: {exc}")
+                self.comm_session.current_demand_hal_task.add_done_callback(_cd_done_cb)
+            except Exception as e:
+                logger.warning(f"Async HAL command scheduling failed: {e}")
+        else:
+            try:
+                await self.comm_session.evse_controller.send_charging_command(
+                    ev_data_context.target_voltage,
+                    ev_data_context.target_current,
+                )
+            except asyncio.TimeoutError:
+                self.stop_state_machine(
+                    "Error sending targets to charging station in charging loop.",
+                    message,
+                    ResponseCode.FAILED,
+                )
+                return
 
         await self.comm_session.evse_controller.send_display_params()
 
@@ -2554,14 +2634,28 @@ class CurrentDemand(StateSECC):
             # MeteringReceiptReq
             next_state = MeteringReceipt
 
-        # Apply a tighter watchdog during CurrentDemand if configured
+        # Apply watchdog during CurrentDemand if configured, then add quirk multiplier
         try:
-            cd_timeout = float(getattr(self.comm_session.config, "current_demand_timeout_s", 0.0) or 0.0)
+            cd_timeout = float(
+                getattr(
+                    self.comm_session.config, "current_demand_timeout_s", 0.0
+                )
+                or 0.0
+            )
         except Exception:
             cd_timeout = 0.0
-        effective_timeout = (
+        base_timeout = (
             cd_timeout if cd_timeout and cd_timeout > 0 else Timeouts.V2G_SECC_SEQUENCE_TIMEOUT
         )
+        try:
+            mult = float(self.comm_session.quirk_profile.timeout_multiplier or 1.0)
+            if mult < 0.5:
+                mult = 0.5
+            elif mult > 2.0:
+                mult = 2.0
+        except Exception:
+            mult = 1.0
+        effective_timeout = base_timeout * mult
 
         self.create_next_message(
             next_state,

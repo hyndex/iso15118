@@ -29,6 +29,19 @@ def comm_evcc_session_mock():
     return comm_session_mock
 
 
+# Compatibility fixture for tests expecting 'event_loop'
+import asyncio
+
+
+@pytest.fixture
+def event_loop():
+    loop = asyncio.new_event_loop()
+    try:
+        yield loop
+    finally:
+        loop.close()
+
+
 @pytest.fixture
 def comm_secc_session_mock():
     comm_session_mock = Mock(spec=SECCCommunicationSession)

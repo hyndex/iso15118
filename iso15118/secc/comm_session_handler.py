@@ -24,6 +24,7 @@ from iso15118.secc.failed_responses import (
     init_failed_responses_iso_v20,
 )
 from iso15118.secc.secc_settings import Config
+from iso15118.secc.quirks import QuirkProfile
 from iso15118.secc.transport.tcp_server import TCPServer
 from iso15118.secc.transport.udp_server import UDPServer
 from iso15118.shared.comm_session import V2GCommunicationSession
@@ -139,6 +140,11 @@ class SECCCommunicationSession(V2GCommunicationSession):
         # TODO Add support for ISO 15118-20 MeterInfo
         self.sent_meter_info: Optional[MeterInfoV2] = None
         self.is_tls = self._is_tls(transport)
+        # Session-scoped compatibility profile and diagnostics
+        self.quirk_profile: QuirkProfile = QuirkProfile()
+        self.diag_counters: Dict[str, int] = {}
+        self.last_current_demand_mono: float = 0.0
+        self.current_demand_hal_task: Optional[asyncio.Task] = None
 
     def save_session_info(self):
         # TODO make sure to not delete the comm session object
@@ -162,7 +168,19 @@ class SECCCommunicationSession(V2GCommunicationSession):
         return True if writer.get_extra_info("sslcontext") else False
 
     async def stop(self, reason: str):
+        # Best-effort cancel any in-flight fast-path HAL command
+        try:
+            if self.current_demand_hal_task and not self.current_demand_hal_task.done():
+                self.current_demand_hal_task.cancel()
+        except Exception:
+            pass
         await self.evse_controller.stop_charger()
+        # Emit a brief summary of any diagnostics collected during the session
+        if self.diag_counters:
+            try:
+                logger.info(f"Session diagnostics: {self.diag_counters}")
+            except Exception:
+                pass
         await super().stop(reason)
 
 

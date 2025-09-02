@@ -483,6 +483,8 @@ class V2GCommunicationSession(SessionStateMachine):
             self._metrics_udp: Optional[str] = os.environ.get("V2G_METRICS_UDP") or None
         except Exception:
             self._metrics_udp = None
+        # Background teardown task handle
+        self._teardown_task: Optional[asyncio.Task] = None
 
     def _effective_timeout(self, timeout: float) -> float:
         """Apply environment-driven caps to the given timeout value.
@@ -575,23 +577,34 @@ class V2GCommunicationSession(SessionStateMachine):
         except Exception:
             pass
 
-        await asyncio.sleep(2)
-        # Signal data link layer to either terminate or pause the data
-        # link connection
-        if hasattr(self.comm_session, "evse_controller"):
-            evse_controller = self.comm_session.evse_controller
-            await evse_controller.update_data_link(terminate_or_pause)
-            await evse_controller.session_ended(str(self.current_state), reason)
-        elif hasattr(self.comm_session, "ev_controller"):
-            await self.comm_session.ev_controller.enable_charging(False)
-        logger.info(f"{terminate_or_pause}d the data link")
-        await asyncio.sleep(3)
+        # Perform teardown asynchronously to avoid blocking callers
+        async def _perform_teardown():
+            await asyncio.sleep(2)
+            # Signal data link layer to either terminate or pause the data link
+            if hasattr(self.comm_session, "evse_controller"):
+                evse_controller = self.comm_session.evse_controller
+                await evse_controller.update_data_link(terminate_or_pause)
+                await evse_controller.session_ended(str(self.current_state), reason)
+            elif hasattr(self.comm_session, "ev_controller"):
+                await self.comm_session.ev_controller.enable_charging(False)
+            logger.info(f"{terminate_or_pause}d the data link")
+            await asyncio.sleep(3)
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except (asyncio.TimeoutError, ConnectionResetError) as exc:
+                logger.info(str(exc))
+            logger.info(
+                "TCP connection closed to peer with address " f"{self.peer_name}"
+            )
+
         try:
-            self.writer.close()
-            await self.writer.wait_closed()
-        except (asyncio.TimeoutError, ConnectionResetError) as exc:
-            logger.info(str(exc))
-        logger.info("TCP connection closed to peer with address " f"{self.peer_name}")
+            if self._teardown_task and not self._teardown_task.done():
+                self._teardown_task.cancel()
+            self._teardown_task = asyncio.create_task(_perform_teardown())
+        except Exception:
+            # If scheduling failed, fallback to inline teardown
+            await _perform_teardown()
 
     def _emit_session_metrics(self, reason: str) -> None:
         """Emit a single JSON line with session counters and state.
@@ -783,9 +796,12 @@ class V2GCommunicationSession(SessionStateMachine):
                     error_msg = f"{exc.__class__.__name__} occurred. {str(exc)}"
 
                 self.stop_reason = StopNotification(False, error_msg, self.peer_name)
-
+                # Notify observers immediately to avoid being blocked by teardown sleeps
+                try:
+                    self.session_handler_queue.put_nowait(self.stop_reason)
+                except Exception:
+                    pass
                 await self.stop(reason=error_msg)
-                self.session_handler_queue.put_nowait(self.stop_reason)
                 return
             gc_enabled = gc.isenabled()
             try:
@@ -818,10 +834,14 @@ class V2GCommunicationSession(SessionStateMachine):
                     await self._update_state_info(self.current_state)
 
                 if self.current_state.next_state in (Terminate, Pause):
+                    # Notify observers first, then perform teardown
+                    try:
+                        self.comm_session.session_handler_queue.put_nowait(
+                            self.comm_session.stop_reason
+                        )
+                    except Exception:
+                        pass
                     await self.stop(reason=self.comm_session.stop_reason.reason)
-                    self.comm_session.session_handler_queue.put_nowait(
-                        self.comm_session.stop_reason
-                    )
                     return
 
                 timeout = self.current_state.next_msg_timeout
@@ -878,9 +898,11 @@ class V2GCommunicationSession(SessionStateMachine):
                     stop_reason,
                     self.peer_name,
                 )
-
+                try:
+                    self.session_handler_queue.put_nowait(self.stop_reason)
+                except Exception:
+                    pass
                 await self.stop(stop_reason)
-                self.session_handler_queue.put_nowait(self.stop_reason)
                 return
             finally:
                 if gc_enabled:
