@@ -752,6 +752,7 @@ class V2GCommunicationSession(SessionStateMachine):
                     except Exception:
                         stage = None
                     last_rx = getattr(self, "_last_rx_name", None)
+                    # Base message
                     if self.last_message_sent:
                         error_msg = (
                             f"EV not responding: waited {timeout} s in stage={stage} "
@@ -762,6 +763,22 @@ class V2GCommunicationSession(SessionStateMachine):
                             f"EV not responding: waited {timeout} s in stage={stage}; "
                             f"last_rx={last_rx or 'None'} (likely awaiting SupportedAppProtocolReq)"
                         )
+                    # Heuristic: if we timed out right after SAP selection (SessionSetup*),
+                    # classify as probable protocol mismatch.
+                    try:
+                        from iso15118.shared.messages.enums import Protocol as _Proto
+
+                        if (
+                            stage is not None
+                            and stage.startswith("SessionSetup")
+                            and getattr(self.comm_session, "protocol", _Proto.UNKNOWN)
+                            in (_Proto.ISO_15118_2, _Proto.DIN_SPEC_70121)
+                            and (last_rx == "SupportedAppProtocolReq" or last_rx is None)
+                        ):
+                            sel = getattr(self.comm_session.protocol, "name", None)
+                            error_msg += f"; probable protocol mismatch (EV silent after SAP selection: {sel})"
+                    except Exception:
+                        pass
                 else:
                     error_msg = f"{exc.__class__.__name__} occurred. {str(exc)}"
 

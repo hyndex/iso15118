@@ -52,6 +52,10 @@ class Config:
     # delay used for higher-level shutdown (seconds). Default 0.1s to align
     # with 100 ms requirement. Set to 0 to disable host-enforced immediate cut.
     cp_disconnect_immediate_cutoff_s: float = 0.1
+    # SAP (SupportedAppProtocol) selection behavior
+    # - If True: respect EV's priority
+    # - If False: prefer EVSE configured order for fail-safe (e.g., DIN first)
+    sap_prefer_ev_priority: bool = True
 
     def load_envs(self, env_path: Optional[str] = None) -> None:
         """
@@ -138,6 +142,10 @@ class Config:
         # Immediate contactor open on CP disconnect (host side)
         self.cp_disconnect_immediate_cutoff_s = env.float(
             "SECC_CP_DISCONNECT_IMMEDIATE_CUTOFF_S", default=0.1
+        )
+        # SAP selection preference
+        self.sap_prefer_ev_priority = env.bool(
+            "SECC_SAP_PREFER_EV_PRIORITY", default=True
         )
         load_shared_settings(env_path)
         env.seal()  # raise all errors at once, if any

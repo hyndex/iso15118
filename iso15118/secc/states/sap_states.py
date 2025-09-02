@@ -59,7 +59,35 @@ class SupportedAppProtocol(StateSECC):
 
         sap_req: SupportedAppProtocolReq = msg
 
-        sap_req.app_protocol.sort(key=lambda proto: proto.priority)
+        # Capture EV-offered protocols for diagnostics
+        ev_offers = [
+            {
+                "ns": p.protocol_ns,
+                "major": p.major_version,
+                "minor": p.minor_version,
+                "priority": p.priority,
+                "schema_id": p.schema_id,
+            }
+            for p in sap_req.app_protocol
+        ]
+        # Decide selection order: EV priority or EVSE preference
+        if getattr(self.comm_session.config, "sap_prefer_ev_priority", True):
+            sap_req.app_protocol.sort(key=lambda proto: proto.priority)
+            candidates = sap_req.app_protocol
+        else:
+            # Build candidate list in EVSE preferred order, filtered by EV offers
+            # Map EV-offered namespaces to list of entries for quick lookup
+            ev_index = {}
+            for p in sap_req.app_protocol:
+                ev_index.setdefault(p.protocol_ns, []).append(p)
+            preferred = []
+            for proto in (self.comm_session.config.supported_protocols or []):
+                ns = proto.ns.value
+                # Collect matching EV offers for this ns
+                for p in ev_index.get(ns, []):
+                    preferred.append(p)
+            candidates = preferred if preferred else sap_req.app_protocol
+
         sap_res: Union[SupportedAppProtocolRes, None] = None
         supported_ns_list = [
             protocol.ns.value
@@ -68,7 +96,7 @@ class SupportedAppProtocol(StateSECC):
         next_state: Type[State] = Terminate  # some default that is not None
 
         selected_protocol = Protocol.UNKNOWN
-        for protocol in sap_req.app_protocol:
+        for protocol in candidates:
             if protocol.protocol_ns in supported_ns_list:
                 if (
                     protocol.protocol_ns == Protocol.ISO_15118_2.ns.value
@@ -126,11 +154,24 @@ class SupportedAppProtocol(StateSECC):
                     break
 
         if not sap_res:
-            self.stop_state_machine(
-                "SupportedAppProtocol negotiation failed. ",
-                message,
-                ResponseCodeSAP.NEGOTIATION_FAILED,
+            # Build a detailed reason including EV vs EVSE capabilities
+            try:
+                ev_list = [
+                    f"{o['ns']} v{o['major']}.{o['minor']} (prio={o['priority']})"
+                    for o in ev_offers
+                ]
+            except Exception:
+                ev_list = []
+            try:
+                evse_list = [p.name for p in (self.comm_session.config.supported_protocols or [])]
+            except Exception:
+                evse_list = []
+            reason = (
+                "No common protocol – EV supports "
+                + ", ".join(ev_list) + "; EVSE supports " + ", ".join(evse_list)
             )
+            logger.error("SupportedAppProtocol negotiation failed: %s", reason)
+            self.stop_state_machine(reason, message, ResponseCodeSAP.NEGOTIATION_FAILED)
             return
 
         self.create_next_message(
