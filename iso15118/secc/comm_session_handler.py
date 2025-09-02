@@ -25,6 +25,7 @@ from iso15118.secc.failed_responses import (
 )
 from iso15118.secc.secc_settings import Config
 from iso15118.secc.quirks import QuirkProfile
+from iso15118.secc.mismatch_monitor import PowerMismatchMonitor
 from iso15118.secc.transport.tcp_server import TCPServer
 from iso15118.secc.transport.udp_server import UDPServer
 from iso15118.shared.comm_session import V2GCommunicationSession
@@ -145,6 +146,16 @@ class SECCCommunicationSession(V2GCommunicationSession):
         self.diag_counters: Dict[str, int] = {}
         self.last_current_demand_mono: float = 0.0
         self.current_demand_hal_task: Optional[asyncio.Task] = None
+        # Power delivery mismatch monitor (precharge + steady compare)
+        self.mismatch_monitor = PowerMismatchMonitor(
+            precharge_tol_v=self.config.precharge_voltage_tolerance_v,
+            precharge_timeout_s=self.config.precharge_timeout_s,
+            steady_v_tol_frac=self.config.steady_voltage_tolerance_frac,
+            steady_i_tol_frac=self.config.steady_current_tolerance_frac,
+            mismatch_grace_s=self.config.mismatch_grace_s,
+            mismatch_abort_s=self.config.mismatch_abort_s,
+            min_current_for_check_a=self.config.min_current_for_check_a,
+        )
 
     def save_session_info(self):
         # TODO make sure to not delete the comm session object
@@ -181,6 +192,10 @@ class SECCCommunicationSession(V2GCommunicationSession):
                 logger.info(f"Session diagnostics: {self.diag_counters}")
             except Exception:
                 pass
+        try:
+            self.mismatch_monitor.reset()
+        except Exception:
+            pass
         await super().stop(reason)
 
 

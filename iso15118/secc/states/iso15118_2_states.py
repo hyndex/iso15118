@@ -2349,6 +2349,13 @@ class PreCharge(StateSECC):
             return
         ev_data_context = self.comm_session.evse_controller.ev_data_context
         ev_data_context.update_pre_charge_parameters(precharge_req)
+        # Begin precharge monitoring (idempotent)
+        try:
+            self.comm_session.mismatch_monitor.begin_precharge(
+                ev_data_context.target_voltage
+            )
+        except Exception:
+            pass
         # for the PreCharge phase, the requested current must be < 2 A
         # (maximum inrush current according to CC.5.2 in IEC61851 -23)
         present_current = (
@@ -2399,6 +2406,31 @@ class PreCharge(StateSECC):
                 Protocol.ISO_15118_2
             )
         )
+        # Detect precharge mismatch/timeouts against target
+        try:
+            meas_v = evse_present_voltage.get_decimal_value()
+        except Exception:
+            meas_v = ev_data_context.present_voltage or 0.0
+        ok, reason = self.comm_session.mismatch_monitor.check_precharge(
+            measured_voltage_v=meas_v,
+            measured_current_a=present_current_in_a,
+        )
+        if not ok:
+            # Abort safely: do not close contactor later; stop charger
+            try:
+                await self.comm_session.evse_controller.set_hlc_charging(False)
+            except Exception:
+                pass
+            try:
+                await self.comm_session.evse_controller.stop_charger()
+            except Exception:
+                pass
+            self.stop_state_machine(
+                reason,
+                message,
+                ResponseCode.FAILED,
+            )
+            return
 
         precharge_res = PreChargeRes(
             response_code=ResponseCode.OK,
@@ -2494,6 +2526,13 @@ class CurrentDemand(StateSECC):
 
         ev_data_context = self.comm_session.evse_controller.ev_data_context
         ev_data_context.update_charge_loop_parameters(current_demand_req)
+        # Record latest EV requested setpoints for mismatch monitoring
+        try:
+            self.comm_session.mismatch_monitor.record_command(
+                ev_data_context.target_voltage, ev_data_context.target_current
+            )
+        except Exception:
+            pass
 
         # Heuristic: detect rapid CurrentDemand arrivals and enable async HAL path
         now_mono = time.monotonic()
@@ -2618,6 +2657,46 @@ class CurrentDemand(StateSECC):
 
         if current_demand_res.meter_info:
             self.comm_session.sent_meter_info = current_demand_res.meter_info
+
+        # Compare measured vs requested; take action on persistent mismatch
+        try:
+            meas_v = current_demand_res.evse_present_voltage.get_decimal_value()
+        except Exception:
+            meas_v = self.comm_session.evse_controller.evse_data_context.present_voltage
+        try:
+            meas_i = current_demand_res.evse_present_current.get_decimal_value()
+        except Exception:
+            meas_i = self.comm_session.evse_controller.evse_data_context.present_current
+        try:
+            res = self.comm_session.mismatch_monitor.check_steady(
+                measured_voltage_v=float(meas_v or 0.0),
+                measured_current_a=float(meas_i or 0.0),
+                ev_target_voltage_v=float(ev_data_context.target_voltage or 0.0),
+                ev_target_current_a=float(ev_data_context.target_current or 0.0),
+            )
+        except Exception:
+            res = None
+        if res and res.action == "warn" and res.reason:
+            self.comm_session.diag_counters["steady_mismatch_warn"] = (
+                self.comm_session.diag_counters.get("steady_mismatch_warn", 0) + 1
+            )
+            logger.warning(res.reason)
+        if res and not res.ok and res.action == "abort":
+            # Safe shutdown upon persistent mismatch
+            try:
+                await self.comm_session.evse_controller.set_hlc_charging(False)
+            except Exception:
+                pass
+            try:
+                await self.comm_session.evse_controller.stop_charger()
+            except Exception:
+                pass
+            self.stop_state_machine(
+                res.reason or "Persistent power mismatch",
+                message,
+                ResponseCode.FAILED,
+            )
+            return
 
         # TODO Check in which case we would set EVSEMaxCurrent and how to
         #      request it via MQTT. Is optional, so let's leave it out for

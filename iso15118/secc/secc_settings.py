@@ -56,6 +56,19 @@ class Config:
     # - If True: respect EV's priority
     # - If False: prefer EVSE configured order for fail-safe (e.g., DIN first)
     sap_prefer_ev_priority: bool = True
+    # --- Power mismatch detection tolerances/timeouts ---
+    # IEC 61851-23 precharge tolerance ~20 V
+    precharge_voltage_tolerance_v: float = 20.0
+    # Max time to reach precharge target
+    precharge_timeout_s: float = 10.0
+    # Steady-state tolerance (fraction) against EV's requested
+    steady_voltage_tolerance_frac: float = 0.05
+    steady_current_tolerance_frac: float = 0.05
+    # Time windows for mismatch persistence
+    mismatch_grace_s: float = 0.5
+    mismatch_abort_s: float = 2.0
+    # Below this current, skip current mismatch checks to avoid noise
+    min_current_for_check_a: float = 2.0
 
     def load_envs(self, env_path: Optional[str] = None) -> None:
         """
@@ -146,6 +159,28 @@ class Config:
         # SAP selection preference
         self.sap_prefer_ev_priority = env.bool(
             "SECC_SAP_PREFER_EV_PRIORITY", default=True
+        )
+        # Power mismatch detection thresholds
+        self.precharge_voltage_tolerance_v = env.float(
+            "SECC_PRECHARGE_TOL_V", default=20.0
+        )
+        self.precharge_timeout_s = env.float(
+            "SECC_PRECHARGE_TIMEOUT_S", default=10.0
+        )
+        self.steady_voltage_tolerance_frac = env.float(
+            "SECC_STEADY_V_TOL_FRAC", default=0.05
+        )
+        self.steady_current_tolerance_frac = env.float(
+            "SECC_STEADY_I_TOL_FRAC", default=0.05
+        )
+        self.mismatch_grace_s = env.float(
+            "SECC_MISMATCH_GRACE_S", default=0.5
+        )
+        self.mismatch_abort_s = env.float(
+            "SECC_MISMATCH_ABORT_S", default=2.0
+        )
+        self.min_current_for_check_a = env.float(
+            "SECC_MIN_CURRENT_FOR_CHECK_A", default=2.0
         )
         load_shared_settings(env_path)
         env.seal()  # raise all errors at once, if any
