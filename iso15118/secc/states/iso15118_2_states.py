@@ -2442,6 +2442,46 @@ class CurrentDemand(StateSECC):
             await PowerDelivery(self.comm_session).process_message(message, message_exi)
             return
 
+        # Safety guard: ensure CP remains in C/D during CurrentDemand loop.
+        # If CP indicates error (E/F) or not-ready (A/B), stop safely.
+        try:
+            cp_state = await self.comm_session.evse_controller.get_cp_state()
+        except Exception:
+            cp_state = None
+        if cp_state is not None:
+            from iso15118.shared.messages.enums import CpState as _Cp
+            if cp_state in (_Cp.E, _Cp.F):
+                try:
+                    # Immediately stop power electronics and open contactor
+                    await self.comm_session.evse_controller.set_hlc_charging(False)
+                except Exception:
+                    pass
+                try:
+                    await self.comm_session.evse_controller.stop_charger()
+                except Exception:
+                    pass
+                self.stop_state_machine(
+                    "Emergency CP error state detected during CurrentDemand",
+                    message,
+                    ResponseCode.FAILED,
+                )
+                return
+            if cp_state in (_Cp.A1, _Cp.A2, _Cp.B1, _Cp.B2):
+                try:
+                    await self.comm_session.evse_controller.set_hlc_charging(False)
+                except Exception:
+                    pass
+                try:
+                    await self.comm_session.evse_controller.stop_charger()
+                except Exception:
+                    pass
+                self.stop_state_machine(
+                    "CP left charging state (C/D) unexpectedly during CurrentDemand",
+                    message,
+                    ResponseCode.FAILED,
+                )
+                return
+
         current_demand_req: CurrentDemandReq = msg.body.current_demand_req
 
         ev_data_context = self.comm_session.evse_controller.ev_data_context
