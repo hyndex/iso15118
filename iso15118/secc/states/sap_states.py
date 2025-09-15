@@ -76,17 +76,21 @@ class SupportedAppProtocol(StateSECC):
             candidates = sap_req.app_protocol
         else:
             # Build candidate list in EVSE preferred order, filtered by EV offers
-            # Map EV-offered namespaces to list of entries for quick lookup
             ev_index = {}
             for p in sap_req.app_protocol:
                 ev_index.setdefault(p.protocol_ns, []).append(p)
             preferred = []
             for proto in (self.comm_session.config.supported_protocols or []):
                 ns = proto.ns.value
-                # Collect matching EV offers for this ns
-                for p in ev_index.get(ns, []):
-                    preferred.append(p)
+                preferred.extend(ev_index.get(ns, []))
             candidates = preferred if preferred else sap_req.app_protocol
+
+        # Optional hard override (e.g., force DIN to improve compatibility)
+        try:
+            import os as _os
+            force = (_os.environ.get("SECC_FORCE_PROTOCOL") or "").strip().upper()
+        except Exception:
+            force = ""
 
         sap_res: Union[SupportedAppProtocolRes, None] = None
         supported_ns_list = [
@@ -96,62 +100,37 @@ class SupportedAppProtocol(StateSECC):
         next_state: Type[State] = Terminate  # some default that is not None
 
         selected_protocol = Protocol.UNKNOWN
-        for protocol in candidates:
-            if protocol.protocol_ns in supported_ns_list:
-                if (
-                    protocol.protocol_ns == Protocol.ISO_15118_2.ns.value
-                    and protocol.major_version == 2
-                ):
-                    selected_protocol = Protocol.get_by_ns(protocol.protocol_ns)
-                    next_state = SessionSetupV2
-
-                    if protocol.minor_version == 0:
-                        res = ResponseCodeSAP.NEGOTIATION_OK
-                    else:
-                        res = ResponseCodeSAP.MINOR_DEVIATION
-
-                    sap_res = SupportedAppProtocolRes(
-                        response_code=res, schema_id=protocol.schema_id
-                    )
-                    break
-
-                if (
-                    protocol.protocol_ns == Protocol.DIN_SPEC_70121.ns.value
-                    and protocol.major_version == 2
-                ):
-                    selected_protocol = Protocol.get_by_ns(protocol.protocol_ns)
-
-                    # This is the earliest point where we realize
-                    # that we are dealing with DINSPEC.
-                    self.comm_session.selected_charging_type_is_ac = False
-                    next_state = SessionSetupDINSPEC
-
-                    if protocol.minor_version == 0:
-                        res = ResponseCodeSAP.NEGOTIATION_OK
-                    else:
-                        res = ResponseCodeSAP.MINOR_DEVIATION
-
-                    sap_res = SupportedAppProtocolRes(
-                        response_code=res, schema_id=protocol.schema_id
-                    )
-                    break
-
-                if (
-                    protocol.protocol_ns.startswith(Namespace.ISO_V20_BASE)
-                    and protocol.major_version == 1
-                ):
-                    selected_protocol = Protocol.get_by_ns(protocol.protocol_ns)
-                    next_state = SessionSetupV20
-
-                    if protocol.minor_version == 0:
-                        res = ResponseCodeSAP.NEGOTIATION_OK
-                    else:
-                        res = ResponseCodeSAP.MINOR_DEVIATION
-
-                    sap_res = SupportedAppProtocolRes(
-                        response_code=res, schema_id=protocol.schema_id
-                    )
-                    break
+        for proto in candidates:
+            if proto.protocol_ns not in supported_ns_list:
+                continue
+            # Respect optional force override if provided
+            if force:
+                if force.startswith("DIN") and proto.protocol_ns != Protocol.DIN_SPEC_70121.ns.value:
+                    continue
+                if force.startswith("ISO_15118_2") and proto.protocol_ns != Protocol.ISO_15118_2.ns.value:
+                    continue
+                if force.startswith("ISO_15118_20") and not proto.protocol_ns.startswith(Namespace.ISO_V20_BASE):
+                    continue
+            # Choose based on the candidate's namespace
+            if proto.protocol_ns == Protocol.DIN_SPEC_70121.ns.value and proto.major_version == 2:
+                selected_protocol = Protocol.get_by_ns(proto.protocol_ns)
+                self.comm_session.selected_charging_type_is_ac = False
+                next_state = SessionSetupDINSPEC
+                res = ResponseCodeSAP.NEGOTIATION_OK if proto.minor_version == 0 else ResponseCodeSAP.MINOR_DEVIATION
+                sap_res = SupportedAppProtocolRes(response_code=res, schema_id=proto.schema_id)
+                break
+            if proto.protocol_ns == Protocol.ISO_15118_2.ns.value and proto.major_version == 2:
+                selected_protocol = Protocol.get_by_ns(proto.protocol_ns)
+                next_state = SessionSetupV2
+                res = ResponseCodeSAP.NEGOTIATION_OK if proto.minor_version == 0 else ResponseCodeSAP.MINOR_DEVIATION
+                sap_res = SupportedAppProtocolRes(response_code=res, schema_id=proto.schema_id)
+                break
+            if proto.protocol_ns.startswith(Namespace.ISO_V20_BASE) and proto.major_version == 1:
+                selected_protocol = Protocol.get_by_ns(proto.protocol_ns)
+                next_state = SessionSetupV20
+                res = ResponseCodeSAP.NEGOTIATION_OK if proto.minor_version == 0 else ResponseCodeSAP.MINOR_DEVIATION
+                sap_res = SupportedAppProtocolRes(response_code=res, schema_id=proto.schema_id)
+                break
 
         if not sap_res:
             # Build a detailed reason including EV vs EVSE capabilities

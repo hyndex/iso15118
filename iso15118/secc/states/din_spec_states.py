@@ -121,12 +121,23 @@ class SessionSetup(StateSECC):
             )
             self.response_code = ResponseCode.OK_NEW_SESSION_ESTABLISHED
 
+        # Allow disabling timestamp for compatibility via config (.env)
+        include_ts = True
+        try:
+            cfg = getattr(self.comm_session, "config", None)
+            if cfg is not None and isinstance(getattr(cfg, "env_dump", None), dict):
+                raw = cfg.env_dump.get("SECC_INCLUDE_TIMESTAMP")
+                if raw is not None:
+                    include_ts = str(raw).strip().lower() not in ("0", "false", "no")
+        except Exception:
+            include_ts = True
+        dt_val = time.time() if include_ts else None
         session_setup_res = SessionSetupRes(
             response_code=self.response_code,
             evse_id=await self.comm_session.evse_controller.get_evse_id(
                 Protocol.DIN_SPEC_70121
             ),
-            datetime_now=time.time(),
+            datetime_now=dt_val,
         )
 
         self.comm_session.evcc_id = session_setup_req.evcc_id
