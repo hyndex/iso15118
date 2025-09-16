@@ -19,10 +19,23 @@ class ExificientEXICodec(IEXICodec):
         from py4j.java_gateway import JavaGateway
 
         logging.getLogger("py4j").setLevel(logging.CRITICAL)
+        # Launch a persistent JVM with startup-optimized flags for low-latency encode/decode
+        # on resource-constrained devices (e.g., Raspberry Pi). The flags bias towards
+        # fast startup (C1 only) and smaller heaps to reduce GC pauses.
+        java_opts = [
+            "--add-opens", "java.base/java.lang=ALL-UNNAMED",
+            "-server",
+            "-Xms48m",
+            "-Xmx128m",
+            "-XX:+UseSerialGC",
+            "-XX:TieredStopAtLevel=1",
+            "-XX:InitialCodeCacheSize=16m",
+            "-XX:ReservedCodeCacheSize=32m",
+        ]
         self.gateway = JavaGateway.launch_gateway(
             classpath=JAR_FILE_PATH,
             die_on_exit=True,
-            javaopts=["--add-opens", "java.base/java.lang=ALL-UNNAMED"],
+            javaopts=java_opts,
         )
 
         self.exi_codec = self.gateway.jvm.com.siemens.ct.exi.main.cmd.EXICodec()
