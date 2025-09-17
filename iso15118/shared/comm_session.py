@@ -302,7 +302,21 @@ class SessionStateMachine(ABC):
         based on the next incoming message.
         """
         if self.current_state.next_state:
+            # Transition to the next state
             self.current_state.next_state(self.comm_session)
+            # Best-effort: notify observers of the new state asynchronously so
+            # integrations (e.g., HAL/BMS snapshot logging) can react exactly on
+            # state entry. This complements the synchronous notify after send().
+            try:
+                import asyncio as _asyncio  # local alias to avoid shadowing
+
+                upd = getattr(self, "_update_state_info", None)
+                if callable(upd):
+                    # Schedule without blocking the main receive loop
+                    _asyncio.get_event_loop().create_task(upd(self.current_state))
+            except Exception:
+                # Never let observer notification affect state progression
+                pass
 
     def _is_duplicate_and_can_resend(self, payload: bytes) -> bool:
         """Detect duplicate RX payload and decide whether to resend last response.
@@ -729,7 +743,7 @@ class V2GCommunicationSession(SessionStateMachine):
                         )
                     )
                     return
-            except (asyncio.TimeoutError, ConnectionResetError) as exc:
+            except (asyncio.TimeoutError, ConnectionResetError, asyncio.IncompleteReadError) as exc:
                 # Optional grace extension: if we timed out but CP is still connected,
                 # allow one more short wait to accommodate slower counterparts.
                 if isinstance(exc, asyncio.TimeoutError):
@@ -793,7 +807,17 @@ class V2GCommunicationSession(SessionStateMachine):
                     except Exception:
                         pass
                 else:
-                    error_msg = f"{exc.__class__.__name__} occurred. {str(exc)}"
+                    # Treat IncompleteReadError as a graceful peer close when no bytes were read
+                    if isinstance(exc, asyncio.IncompleteReadError):
+                        try:
+                            if getattr(exc, 'expected', 0) and not getattr(exc, 'partial', b'') and self.reader.at_eof():
+                                error_msg = "TCP peer closed connection"
+                            else:
+                                error_msg = f"{exc.__class__.__name__} occurred. {str(exc)}"
+                        except Exception:
+                            error_msg = f"{exc.__class__.__name__} occurred. {str(exc)}"
+                    else:
+                        error_msg = f"{exc.__class__.__name__} occurred. {str(exc)}"
 
                 self.stop_reason = StopNotification(False, error_msg, self.peer_name)
                 # Notify observers immediately to avoid being blocked by teardown sleeps
@@ -830,8 +854,11 @@ class V2GCommunicationSession(SessionStateMachine):
                             "Charge-loop processing latency high: %.0f ms", (t1 - t0) * 1000
                         )
                 except Exception:
+                    # Logging must not break state updates
                     pass
-                    await self._update_state_info(self.current_state)
+                # Always notify the EVSE/EV controller about the present protocol state
+                # so observers (e.g., HAL integrations) can emit structured snapshots.
+                await self._update_state_info(self.current_state)
 
                 if self.current_state.next_state in (Terminate, Pause):
                     # Notify observers first, then perform teardown
