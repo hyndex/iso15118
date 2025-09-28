@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import socket
 import struct
 from asyncio import DatagramTransport
@@ -45,9 +46,22 @@ class UDPServer(asyncio.DatagramProtocol):
         self._rcv_queue: asyncio.Queue = asyncio.Queue()
         self._transport: Optional[DatagramTransport] = None
         self.pause_server: bool = False
+        # Keep a handle to the underlying socket for multicast re-join/rebind
+        self._sock: Optional[socket.socket] = None
+        # One-shot watchdog to re-arm multicast if no SDP arrives shortly after start
+        try:
+            self._sdp_watchdog_s: float = float(os.environ.get("EVSE_SDP_WATCHDOG_S", "3.0"))
+        except Exception:
+            self._sdp_watchdog_s = 3.0
+        try:
+            self._sdp_rebind_on_watchdog: bool = (
+                os.environ.get("EVSE_SDP_REBIND_ON_WATCHDOG", "1").strip().lower()
+                not in ("0", "false", "no", "")
+            )
+        except Exception:
+            self._sdp_rebind_on_watchdog = True
 
-    @staticmethod
-    async def _create_socket(iface: str) -> socket.socket:
+    async def _create_socket(self, iface: str) -> socket.socket:
         """
         This method is necessary because Python does not allow
         async def __init__.
@@ -105,7 +119,32 @@ class UDPServer(asyncio.DatagramProtocol):
             socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, join_multicast_group_req
         )
 
+        # Save for later multicast maintenance
+        self._sock = sock
         return sock
+
+    def _multicast_leave_join(self) -> None:
+        """Attempt to refresh IPv6 multicast group membership on iface.
+
+        Safe to call multiple times; ignores errors. Used by the SDP watchdog.
+        """
+        if self._sock is None:
+            return
+        try:
+            grp = socket.inet_pton(socket.AF_INET6, SDP_MULTICAST_GROUP)
+            if_index = socket.if_nametoindex(self.iface)
+            mreq = grp + struct.pack("@I", if_index)
+            # Best-effort leave then join
+            try:
+                self._sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_LEAVE_GROUP, mreq)
+            except OSError:
+                pass
+            self._sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+            logger.info(
+                "Refreshed IPv6 multicast membership",
+            )
+        except Exception as e:
+            logger.warning("Multicast refresh failed", extra={"error": str(e)})
 
     async def start(self, ready_event: asyncio.Event):
         """UDP server tasks to start"""
@@ -127,7 +166,53 @@ class UDPServer(asyncio.DatagramProtocol):
         )
         ready_event.set()
         tasks = [self.rcv_task()]
+        # Arm a one-shot watchdog to recover from missing SDP after SLAC
+        if self._sdp_watchdog_s and self._sdp_watchdog_s > 0:
+            loop.create_task(self._sdp_watchdog_once(self._sdp_watchdog_s))
         await wait_for_tasks(tasks)
+
+    async def _sdp_watchdog_once(self, delay_s: float) -> None:
+        """If no SDP arrives quickly after start, refresh multicast or rebind.
+
+        This covers cases where the NIC/driver keeps stale multicast state after
+        SLAC or a previous session. Controlled by env:
+          - EVSE_SDP_WATCHDOG_S (float seconds, default 3.0; 0 disables)
+          - EVSE_SDP_REBIND_ON_WATCHDOG (1 default) to fully rebind the socket
+        """
+        try:
+            await asyncio.sleep(max(0.1, float(delay_s)))
+        except Exception:
+            return
+        # If paused or already received something, do nothing
+        if self.pause_server:
+            return
+        if not self._rcv_queue.empty():
+            return
+        logger.warning(
+            "No SDP received within watchdog window; refreshing multicast",
+            extra={"delay_s": delay_s, "iface": self.iface},
+        )
+        try:
+            # First try a simple leave+join on the existing socket
+            self._multicast_leave_join()
+        except Exception:
+            pass
+        # If configured, re-create the socket/transport entirely
+        if self._sdp_rebind_on_watchdog:
+            try:
+                loop = asyncio.get_running_loop()
+                if self._transport is not None:
+                    try:
+                        self._transport.close()
+                    except Exception:
+                        pass
+                self._transport, _ = await loop.create_datagram_endpoint(
+                    lambda: self,
+                    sock=await self._create_socket(self.iface),
+                )
+                logger.info("UDP server re-bound after multicast refresh")
+            except Exception as e:
+                logger.warning("UDP server rebind failed", extra={"error": str(e)})
 
     def connection_made(self, transport):
         """
