@@ -323,6 +323,15 @@ class SessionStateMachine(ABC):
 
         Uses a short time window and max resend count to avoid loops.
         """
+        # Do not auto-resend cached responses in time-sensitive phases like
+        # PreCharge or CurrentDemand. These phases require re-evaluating and
+        # reporting the latest EVSEPresentVoltage/Current on every request.
+        try:
+            st_name = type(self.current_state).__name__
+            if st_name in ("PreCharge", "CurrentDemand", "DCPreCharge"):
+                return False
+        except Exception:
+            pass
         if not getattr(self, "_dup_resend_enabled", True):
             return False
         try:
