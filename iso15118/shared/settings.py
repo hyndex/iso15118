@@ -26,7 +26,8 @@ def load_shared_settings(env_path: Optional[str] = None):
 
     settings = {
         SettingKey.PKI_PATH: env.str("PKI_PATH", default=SHARED_CWD + "/pki/"),
-        SettingKey.MESSAGE_LOG_JSON: env.bool("MESSAGE_LOG_JSON", default=True),
+        # Default off to reduce per-message overhead unless explicitly enabled
+        SettingKey.MESSAGE_LOG_JSON: env.bool("MESSAGE_LOG_JSON", default=False),
         SettingKey.MESSAGE_LOG_EXI: env.bool("MESSAGE_LOG_EXI", default=False),
         SettingKey.ENABLE_TLS_1_3: env.bool("ENABLE_TLS_1_3", default=False),
         SettingKey.EXI_SESSION_DIR: env.str("EXI_SESSION_DIR", default=os.path.join(WORK_DIR, "exi_sessions")),

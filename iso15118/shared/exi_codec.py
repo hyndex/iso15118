@@ -2,6 +2,7 @@ import json
 import logging
 from base64 import b64decode, b64encode
 import os
+import time
 from typing import Optional, Type, Union
 
 from pydantic import ValidationError
@@ -172,6 +173,11 @@ class EXI:
         if cls._instance is None:
             cls._instance = super(EXI, cls).__new__(cls)
             cls._instance.exi_codec = None
+            # Timing/size diagnostics for last encode/decode
+            cls._instance.last_to_exi_ms: float = 0.0
+            cls._instance.last_from_exi_ms: float = 0.0
+            cls._instance.last_to_exi_len: int = 0
+            cls._instance.last_from_exi_len: int = 0
         return cls._instance
 
     def set_exi_codec(self, codec: IEXICodec):
@@ -249,7 +255,14 @@ class EXI:
             logger.info(f"Message to encode (ns={protocol_ns}): {msg_content}")
 
         try:
+            _t0 = time.time()
             exi_stream = self.exi_codec.encode(msg_content, protocol_ns)
+            _t1 = time.time()
+            self.last_to_exi_ms = max(0.0, (_t1 - _t0) * 1000.0)
+            try:
+                self.last_to_exi_len = len(exi_stream or b"")
+            except Exception:
+                self.last_to_exi_len = 0
         except Exception as exc:
             logger.error(
                 f"EXIEncodingError in {protocol_ns} with {str(msg_content)}: {exc}"
@@ -296,7 +309,14 @@ class EXI:
             logger.debug(f"EXI-encoded message (ns={namespace}): {exi_message.hex()}")
 
         try:
+            _t0 = time.time()
             exi_decoded = self.exi_codec.decode(exi_message, namespace)
+            _t1 = time.time()
+            self.last_from_exi_ms = max(0.0, (_t1 - _t0) * 1000.0)
+            try:
+                self.last_from_exi_len = len(exi_message or b"")
+            except Exception:
+                self.last_from_exi_len = 0
         except Exception as exc:
             raise EXIDecodingError(
                 f"EXIDecodingError ({exc.__class__.__name__}): " f"{exc}"

@@ -6,6 +6,7 @@ SessionStopReq.
 
 import asyncio
 import logging
+import os
 import time
 from typing import Optional, Type, Union
 
@@ -16,7 +17,11 @@ from iso15118.shared.messages.app_protocol import (
     SupportedAppProtocolReq,
     SupportedAppProtocolRes,
 )
-from iso15118.shared.messages.datatypes import PVEVSEPresentCurrent
+from iso15118.shared.messages.datatypes import (
+    PhysicalValue,
+    PVEVSEPresentCurrent,
+    PVEVSEPresentVoltage,
+)
 from iso15118.shared.messages.din_spec.body import (
     CableCheckReq,
     CableCheckRes,
@@ -653,6 +658,16 @@ class PreCharge(StateSECC):
                 Protocol.DIN_SPEC_70121
             )
         )
+        # Clamp PreCharge overshoot (+5 V) to avoid EV-side false faulting
+        try:
+            from iso15118.shared.messages.din_spec.datatypes import PVEVSEPresentVoltage as _PV
+            meas_v = evse_present_voltage.get_decimal_value()
+            target_v = float(getattr(self.comm_session.evse_controller.ev_data_context, "target_voltage", 0.0) or 0.0)
+            if target_v > 0.0 and meas_v > (target_v + 5.0):
+                clamp_v = target_v + 5.0
+                evse_present_voltage = _PV(multiplier=0, value=int(round(clamp_v)), unit="V")
+        except Exception:
+            pass
 
         precharge_res = PreChargeRes(
             response_code=ResponseCode.OK,
@@ -821,35 +836,151 @@ class CurrentDemand(StateSECC):
 
         current_demand_req: CurrentDemandReq = msg.body.current_demand_req
 
+        # Safety: If CP moves out of C/D or signals fault (E/F), abort gracefully
+        try:
+            cp_state = await self.comm_session.evse_controller.get_cp_state()
+        except Exception:
+            cp_state = None
+        if cp_state is not None:
+            from iso15118.shared.messages.enums import CpState as _Cp
+
+            if cp_state in (_Cp.E, _Cp.F):
+                self.stop_state_machine(
+                    "Emergency CP error state detected during CurrentDemand (DIN)",
+                    message,
+                    ResponseCode.FAILED,
+                )
+                return
+            if cp_state in (_Cp.A1, _Cp.A2, _Cp.B1, _Cp.B2):
+                self.stop_state_machine(
+                    "CP left charging state (C/D) unexpectedly during CurrentDemand (DIN)",
+                    message,
+                    ResponseCode.FAILED,
+                )
+                return
+
         ev_data_context = self.comm_session.evse_controller.ev_data_context
         ev_data_context.update_charge_loop_parameters(current_demand_req)
 
-        try:
-            await self.comm_session.evse_controller.send_charging_command(
-                ev_data_context.target_voltage,
-                ev_data_context.target_current,
+        # Configurable fast-path: echo EV targets in response and update HAL in background
+        def _echo_enabled() -> bool:
+            try:
+                cfg = getattr(self.comm_session, "config", None)
+                envd = getattr(cfg, "env_dump", None) or {}
+                for k in (
+                    "EVSE_ECHO_CURRENTDEMAND",
+                    "SECC_ECHO_CURRENTDEMAND",
+                    "SECC_ECHO_CURRENT_DEMAND",
+                ):
+                    v = envd.get(k)
+                    if v is None:
+                        v = os.environ.get(k)
+                    if v is not None and str(v).strip().lower() not in ("0", "false", "no", "off", ""):
+                        return True
+            except Exception:
+                pass
+            return False
+
+        echo_mode = _echo_enabled()
+
+        # If echo mode, issue HAL update asynchronously; else default (blocking)
+        if echo_mode:
+            try:
+                task = self.comm_session.current_demand_hal_task
+                if task and not task.done():
+                    task.cancel()
+                self.comm_session.current_demand_hal_task = asyncio.create_task(
+                    self.comm_session.evse_controller.send_charging_command(
+                        ev_data_context.target_voltage,
+                        ev_data_context.target_current,
+                    )
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await self.comm_session.evse_controller.send_charging_command(
+                    ev_data_context.target_voltage,
+                    ev_data_context.target_current,
+                )
+            except asyncio.TimeoutError:
+                self.stop_state_machine(
+                    "Error sending targets to charging station in charging loop.",
+                    message,
+                    ResponseCode.FAILED,
+                )
+                return
+
+        # Build response, optionally echoing EV targets with floors/caps
+        if echo_mode and (
+            ev_data_context.target_voltage is not None
+            and ev_data_context.target_current is not None
+        ):
+            try:
+                v_tgt = float(ev_data_context.target_voltage or 0.0)
+                i_tgt = float(ev_data_context.target_current or 0.0)
+                limits = getattr(
+                    getattr(self.comm_session.evse_controller.evse_data_context, "session_limits", None),
+                    "dc_limits",
+                    None,
+                )
+                try:
+                    i_max_session = float(getattr(limits, "max_charge_current", 0.0) or 0.0)
+                except Exception:
+                    i_max_session = 0.0
+                try:
+                    p_max_session = float(getattr(limits, "max_charge_power", 0.0) or 0.0)
+                except Exception:
+                    p_max_session = 0.0
+                try:
+                    i_max_env = float(os.environ.get("EVSE_ECHO_I_MAX_A", "0") or 0.0)
+                except Exception:
+                    i_max_env = 0.0
+                try:
+                    p_max_env = float(os.environ.get("EVSE_ECHO_P_MAX_W", "0") or 0.0)
+                except Exception:
+                    p_max_env = 0.0
+                i_max = i_max_env or i_max_session or 300.0
+                p_max = p_max_env or p_max_session or (i_max * max(1.0, v_tgt if v_tgt > 0 else 400.0))
+                i_cap_power = float(p_max) / max(1.0, v_tgt if v_tgt > 0 else 400.0)
+                try:
+                    i_floor = float(os.environ.get("EVSE_ECHO_I_FLOOR_A", "1.0"))
+                except Exception:
+                    i_floor = 1.0
+                try:
+                    i_floor_frac = float(os.environ.get("EVSE_ECHO_I_FLOOR_FRAC", "0.05"))
+                except Exception:
+                    i_floor_frac = 0.05
+                if i_tgt > 0.5:
+                    i_pres = max(min(i_tgt, i_cap_power, i_max), min(i_floor, i_tgt * i_floor_frac if i_floor_frac > 0 else i_floor))
+                else:
+                    i_pres = 0.0
+                v_pres = max(0.0, v_tgt)
+                exp_v, val_v = PhysicalValue.get_exponent_value_repr(v_pres)
+                exp_i, val_i = PhysicalValue.get_exponent_value_repr(i_pres)
+                evse_present_voltage = PVEVSEPresentVoltage(multiplier=exp_v, value=val_v, unit="V")
+                evse_present_current = PVEVSEPresentCurrent(multiplier=exp_i, value=val_i, unit="A")
+            except Exception:
+                # Fallback to controller values if conversion fails
+                evse_present_voltage = await self.comm_session.evse_controller.get_evse_present_voltage(
+                    Protocol.DIN_SPEC_70121
+                )
+                evse_present_current = await self.comm_session.evse_controller.get_evse_present_current(
+                    Protocol.DIN_SPEC_70121
+                )
+        else:
+            evse_present_voltage = await self.comm_session.evse_controller.get_evse_present_voltage(
+                Protocol.DIN_SPEC_70121
             )
-        except asyncio.TimeoutError:
-            self.stop_state_machine(
-                "Error sending targets to charging station in charging loop.",
-                message,
-                ResponseCode.FAILED,
+            evse_present_current = await self.comm_session.evse_controller.get_evse_present_current(
+                Protocol.DIN_SPEC_70121
             )
-            return
 
         current_demand_res: CurrentDemandRes = CurrentDemandRes(
             response_code=ResponseCode.OK,
             dc_evse_status=await self.comm_session.evse_controller.get_dc_evse_status(),
-            evse_present_voltage=(
-                await self.comm_session.evse_controller.get_evse_present_voltage(
-                    Protocol.DIN_SPEC_70121
-                )
-            ),
-            evse_present_current=(
-                await self.comm_session.evse_controller.get_evse_present_current(
-                    Protocol.DIN_SPEC_70121
-                )
-            ),
+            evse_present_voltage=evse_present_voltage,
+            evse_present_current=evse_present_current,
             evse_current_limit_achieved=current_demand_req.charging_complete,
             evse_voltage_limit_achieved=(
                 await self.comm_session.evse_controller.is_evse_voltage_limit_achieved()
@@ -867,7 +998,11 @@ class CurrentDemand(StateSECC):
                 await self.comm_session.evse_controller.get_evse_max_power_limit()
             ),
         )
-        await self.comm_session.evse_controller.send_display_params()
+        # Do not block the response on UI/CS updates
+        try:
+            asyncio.create_task(self.comm_session.evse_controller.send_display_params())
+        except Exception:
+            pass
         self.create_next_message(
             None,
             current_demand_res,

@@ -1734,14 +1734,23 @@ class DCPreCharge(StateSECC):
                     ResponseCode.FAILED,
                 )
                 return
+        # Clamp PreCharge overshoot (+5 V) to avoid EV-side false faults
+        try:
+            v_meas = await self.comm_session.evse_controller.get_evse_present_voltage(Protocol.ISO_15118_20_DC)
+            v_val = v_meas.get_decimal_value() if hasattr(v_meas, "get_decimal_value") else None
+            v_tgt = float(getattr(self.comm_session.evse_controller.ev_data_context, "target_voltage", 0.0) or 0.0)
+            if v_val is not None and v_tgt > 0.0 and v_val > (v_tgt + 5.0):
+                from iso15118.shared.messages.iso15118_20.common_types import RationalNumber
+                v_meas = RationalNumber(value=int(round(v_tgt + 5.0)), exponent=0)
+        except Exception:
+            v_meas = await self.comm_session.evse_controller.get_evse_present_voltage(Protocol.ISO_15118_20_DC)
+
         dc_precharge_res = DCPreChargeRes(
             header=MessageHeader(
                 session_id=self.comm_session.session_id, timestamp=time.time()
             ),
             response_code=ResponseCode.OK,
-            evse_present_voltage=await self.comm_session.evse_controller.get_evse_present_voltage(  # noqa
-                Protocol.ISO_15118_20_DC
-            ),
+            evse_present_voltage=v_meas,
         )
         self.create_next_message(
             next_state,

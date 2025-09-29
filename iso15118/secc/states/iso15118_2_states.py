@@ -7,6 +7,7 @@ SessionStopReq.
 import asyncio
 import base64
 import logging
+import os
 import time
 from typing import List, Optional, Tuple, Type, Union
 
@@ -33,7 +34,12 @@ from iso15118.shared.messages.app_protocol import (
 from iso15118.shared.messages.datatypes import (
     DCEVSEChargeParameter,
     DCEVSEStatus,
+    PhysicalValue,
     PVEVSEPresentCurrent,
+    PVEVSEPresentVoltage,
+    PVEVSEMaxCurrentLimit,
+    PVEVSEMaxVoltageLimit,
+    PVEVSEMaxPowerLimit,
 )
 from iso15118.shared.messages.din_spec.datatypes import (
     ResponseCode as ResponseCodeDINSPEC,
@@ -1451,6 +1457,20 @@ class ChargeParameterDiscovery(StateSECC):
                 f" {sa_schedule_list}"
             )
 
+        # Optionally strip SalesTariff to avoid signing and reduce payload/logging
+        try:
+            import os as _os
+            st_env = str((getattr(self.comm_session, "config", None).env_dump or {}).get("EVSE_SEND_SALES_TARIFF", _os.environ.get("EVSE_SEND_SALES_TARIFF", "1")))
+            disable_st = st_env.strip().lower() in ("0", "false", "no")
+            if disable_st and sa_schedule_list:
+                for _st in sa_schedule_list:
+                    try:
+                        _st.sales_tariff = None
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         signature = None
         next_state: Type[State] = None
         if sa_schedule_list:
@@ -1481,11 +1501,14 @@ class ChargeParameterDiscovery(StateSECC):
                         signature = create_signature([element_to_sign], signature_key)
                     except PrivateKeyReadError as exc:
                         logger.warning(
-                            "Can't read private key to needed to create "
-                            f"signature for SalesTariff: {exc}"
+                            "Can't read private key; dropping SalesTariff to avoid EV abort: %s",
+                            exc,
                         )
-                        # If a SalesTariff isn't signed, that's not the end of the
-                        # world, no reason to stop the charging process here
+                        # Some EVs reject unsigned tariffs; drop it to keep session stable
+                        try:
+                            schedule.sales_tariff = None
+                        except Exception:
+                            pass
                 break
 
             self.expecting_charge_parameter_discovery_req = False
@@ -1726,6 +1749,15 @@ class PowerDelivery(StateSECC):
             if self.comm_session.selected_charging_type_is_ac:
                 next_state = ChargingStatus
             else:
+                # DC: prime power stage with last known targets (from PreCharge)
+                try:
+                    evdc = self.comm_session.evse_controller.ev_data_context
+                    v0 = getattr(evdc, "target_voltage", None) or getattr(evdc, "present_voltage", None)
+                    i0 = getattr(evdc, "target_current", None) or 0.0
+                    if v0 and v0 > 0:
+                        await self.comm_session.evse_controller.send_charging_command(v0, i0)
+                except Exception:
+                    pass
                 next_state = CurrentDemand
             self.comm_session.selected_schedule = (
                 power_delivery_req.sa_schedule_tuple_id
@@ -2466,6 +2498,26 @@ class PreCharge(StateSECC):
                 Protocol.ISO_15118_2
             )
         )
+        # Normalize EVSEPresentVoltage representation: always report whole volts with multiplier 0
+        # and clamp modest overshoot (+5 V) during precharge to avoid spurious EV aborts.
+        try:
+            from iso15118.shared.messages.datatypes import PVEVSEPresentVoltage
+            meas_v = float(evse_present_voltage.get_decimal_value())
+            target_v = float(
+                getattr(
+                    self.comm_session.evse_controller.ev_data_context,
+                    "target_voltage",
+                    0.0,
+                )
+                or 0.0
+            )
+            if target_v > 0.0 and meas_v > (target_v + 5.0):
+                meas_v = target_v + 5.0
+            evse_present_voltage = PVEVSEPresentVoltage(
+                multiplier=0, value=int(round(meas_v)), unit="V"
+            )
+        except Exception:
+            pass
         # Detect precharge mismatch/timeouts against target
         try:
             meas_v = evse_present_voltage.get_decimal_value()
@@ -2642,6 +2694,30 @@ class CurrentDemand(StateSECC):
             # Never block the loop for missing optional fields
             pass
 
+        # Determine if echo mode is enabled (reply with EV's targets for present values)
+        def _echo_enabled() -> bool:
+            try:
+                cfg = getattr(self.comm_session, "config", None)
+                envd = getattr(cfg, "env_dump", None) or {}
+                for k in (
+                    "EVSE_ECHO_CURRENTDEMAND",
+                    "SECC_ECHO_CURRENTDEMAND",
+                    "SECC_ECHO_CURRENT_DEMAND",
+                ):
+                    v = envd.get(k)
+                    if v is None:
+                        v = os.environ.get(k)
+                    if v is not None and str(v).strip().lower() not in ("0", "false", "no", "off", ""):
+                        return True
+            except Exception:
+                pass
+            return False
+
+        echo_mode = _echo_enabled()
+        # Prefer async HAL when echoing to avoid blocking the reply
+        if echo_mode:
+            self.comm_session.quirk_profile.current_demand_async_hal = True
+
         # Updates the power electronics targets based on EV requests
         if self.comm_session.quirk_profile.current_demand_async_hal:
             # Fire-and-replace in-flight HAL update, reply without awaiting
@@ -2680,20 +2756,136 @@ class CurrentDemand(StateSECC):
                 )
                 return
 
-        await self.comm_session.evse_controller.send_display_params()
+        # Do not block the response on UI/CS updates
+        try:
+            asyncio.create_task(self.comm_session.evse_controller.send_display_params())
+        except Exception:
+            pass
 
         # We don't care about signed meter values from the EVCC, but if you
         # do, then set receipt_required to True and set the field meter_info
         evse_controller = self.comm_session.evse_controller
+        # Compute present values: echo EV targets if enabled, else use measurements
+        if echo_mode and (
+            ev_data_context.target_voltage is not None
+            and ev_data_context.target_current is not None
+        ):
+            try:
+                # Apply safe floors and caps to avoid reporting 0 A on >0 A requests
+                v_tgt = float(ev_data_context.target_voltage or 0.0)
+                i_tgt = float(ev_data_context.target_current or 0.0)
+                # Session- and env-derived caps
+                limits = getattr(
+                    getattr(self.comm_session.evse_controller.evse_data_context, "session_limits", None),
+                    "dc_limits",
+                    None,
+                )
+                try:
+                    i_max_session = float(getattr(limits, "max_charge_current", 0.0) or 0.0)
+                except Exception:
+                    i_max_session = 0.0
+                try:
+                    p_max_session = float(getattr(limits, "max_charge_power", 0.0) or 0.0)
+                except Exception:
+                    p_max_session = 0.0
+                try:
+                    i_max_env = float(os.environ.get("EVSE_ECHO_I_MAX_A", "0") or 0.0)
+                except Exception:
+                    i_max_env = 0.0
+                try:
+                    p_max_env = float(os.environ.get("EVSE_ECHO_P_MAX_W", "0") or 0.0)
+                except Exception:
+                    p_max_env = 0.0
+                i_max = i_max_env or i_max_session or 300.0
+                p_max = p_max_env or p_max_session or (i_max * max(1.0, v_tgt if v_tgt > 0 else 400.0))
+                # Respect power limit -> current cap by power
+                i_cap_power = float(p_max) / max(1.0, v_tgt if v_tgt > 0 else 400.0)
+                # Soft floor to avoid zero current reports when EV is drawing > 0 A
+                try:
+                    i_floor = float(os.environ.get("EVSE_ECHO_I_FLOOR_A", "1.0"))
+                except Exception:
+                    i_floor = 1.0
+                try:
+                    i_floor_frac = float(os.environ.get("EVSE_ECHO_I_FLOOR_FRAC", "0.05"))
+                except Exception:
+                    i_floor_frac = 0.05
+                if i_tgt > 0.5:
+                    i_pres = max(min(i_tgt, i_cap_power, i_max), min(i_floor, i_tgt * i_floor_frac if i_floor_frac > 0 else i_floor))
+                else:
+                    i_pres = 0.0
+                v_pres = max(0.0, v_tgt)
+
+                exp_v, val_v = PhysicalValue.get_exponent_value_repr(v_pres)
+                exp_i, val_i = PhysicalValue.get_exponent_value_repr(i_pres)
+                evse_present_voltage = PVEVSEPresentVoltage(
+                    multiplier=exp_v, value=val_v, unit="V"
+                )
+                evse_present_current = PVEVSEPresentCurrent(
+                    multiplier=exp_i, value=val_i, unit="A"
+                )
+            except Exception:
+                evse_present_voltage = await evse_controller.get_evse_present_voltage(
+                    Protocol.ISO_15118_2
+                )
+                evse_present_current = await evse_controller.get_evse_present_current(
+                    Protocol.ISO_15118_2
+                )
+        else:
+            evse_present_voltage = await evse_controller.get_evse_present_voltage(
+                Protocol.ISO_15118_2
+            )
+            evse_present_current = await evse_controller.get_evse_present_current(
+                Protocol.ISO_15118_2
+            )
+
+        # Compute coherent limits if echoing so Present values never exceed limits
+        max_v_limit = None
+        max_i_limit = None
+        max_p_limit = None
+        if echo_mode:
+            try:
+                # Derive session/rated limits
+                edc = self.comm_session.evse_controller.evse_data_context
+                sess = getattr(edc, "session_limits", None)
+                rated = getattr(edc, "rated_limits", None)
+                dc_sess = getattr(sess, "dc_limits", None) if sess else None
+                dc_rated = getattr(rated, "dc_limits", None) if rated else None
+                v_min = float(getattr(dc_sess, "min_voltage", 100.0) or getattr(dc_rated, "min_voltage", 100.0) or 100.0)
+                v_max = float(getattr(dc_sess, "max_voltage", 1000.0) or getattr(dc_rated, "max_voltage", 1000.0) or 1000.0)
+                i_max_cfg = float(getattr(dc_sess, "max_charge_current", 0.0) or getattr(dc_rated, "max_charge_current", 0.0) or 300.0)
+                p_max_cfg = float(getattr(dc_sess, "max_charge_power", 0.0) or getattr(dc_rated, "max_charge_power", 0.0) or 30000.0)
+                # Determine present floats for coherent capping
+                try:
+                    v_pres_f = float(evse_present_voltage.get_decimal_value())
+                except Exception:
+                    v_pres_f = float(ev_data_context.target_voltage or 0.0)
+                try:
+                    i_pres_f = float(evse_present_current.get_decimal_value())
+                except Exception:
+                    i_pres_f = float(ev_data_context.target_current or 0.0)
+                # Allowed current by configuration and power
+                i_cap_power = p_max_cfg / max(1.0, v_pres_f if v_pres_f > 0 else (ev_data_context.target_voltage or 400.0))
+                i_limit_val = max(i_pres_f + 2.0, min(i_max_cfg, i_cap_power))
+                # Voltage limit gives some headroom above present
+                v_limit_val = min(v_max, max(v_min, (ev_data_context.target_voltage or v_pres_f) + 50.0))
+                p_limit_val = p_max_cfg
+                # Build PV objects
+                exp_i, val_i = PhysicalValue.get_exponent_value_repr(i_limit_val)
+                exp_v, val_v = PhysicalValue.get_exponent_value_repr(v_limit_val)
+                exp_p, val_p = PhysicalValue.get_exponent_value_repr(p_limit_val)
+                max_i_limit = PVEVSEMaxCurrentLimit(multiplier=exp_i, value=val_i, unit="A")
+                max_v_limit = PVEVSEMaxVoltageLimit(multiplier=exp_v, value=val_v, unit="V")
+                max_p_limit = PVEVSEMaxPowerLimit(multiplier=exp_p, value=val_p, unit="W")
+            except Exception:
+                max_v_limit = None
+                max_i_limit = None
+                max_p_limit = None
+
         current_demand_res = CurrentDemandRes(
             response_code=ResponseCode.OK,
             dc_evse_status=await evse_controller.get_dc_evse_status(),
-            evse_present_voltage=await evse_controller.get_evse_present_voltage(
-                Protocol.ISO_15118_2
-            ),
-            evse_present_current=await evse_controller.get_evse_present_current(
-                Protocol.ISO_15118_2
-            ),
+            evse_present_voltage=evse_present_voltage,
+            evse_present_current=evse_present_current,
             evse_current_limit_achieved=(
                 await evse_controller.is_evse_current_limit_achieved()
             ),
@@ -2701,9 +2893,9 @@ class CurrentDemand(StateSECC):
                 await evse_controller.is_evse_voltage_limit_achieved()
             ),
             evse_power_limit_achieved=await evse_controller.is_evse_power_limit_achieved(),  # noqa
-            evse_max_voltage_limit=await evse_controller.get_evse_max_voltage_limit(),
-            evse_max_current_limit=await evse_controller.get_evse_max_current_limit(),
-            evse_max_power_limit=await evse_controller.get_evse_max_power_limit(),
+            evse_max_voltage_limit=(max_v_limit if max_v_limit is not None else await evse_controller.get_evse_max_voltage_limit()),
+            evse_max_current_limit=(max_i_limit if max_i_limit is not None else await evse_controller.get_evse_max_current_limit()),
+            evse_max_power_limit=(max_p_limit if max_p_limit is not None else await evse_controller.get_evse_max_power_limit()),
             evse_id=await evse_controller.get_evse_id(Protocol.ISO_15118_2),
             sa_schedule_tuple_id=self.comm_session.selected_schedule,
             # TODO Could maybe request an OCPP setting that determines

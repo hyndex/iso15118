@@ -219,9 +219,18 @@ class SessionStateMachine(ABC):
             None,
         ] = None
         try:
-            decoded_message = EXI().from_exi(
+            _t_dec0 = time.time()
+            _exi = EXI()
+            decoded_message = _exi.from_exi(
                 v2gtp_msg.payload, self.get_exi_ns(v2gtp_msg.payload_type)
             )
+            _t_dec1 = time.time()
+            try:
+                # Persist decode timing/size for diagnostics
+                self._last_decode_ms = max(0.0, (_t_dec1 - _t_dec0) * 1000.0)  # type: ignore[attr-defined]
+                self._last_exi_dec_bytes = int(getattr(_exi, "last_from_exi_len", 0))  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
             if hasattr(self.comm_session, "evse_id"):
                 logger.trace(  # type: ignore[attr-defined]
@@ -260,7 +269,17 @@ class SessionStateMachine(ABC):
                 self._last_rx_name = type(decoded_message).__name__  # type: ignore[attr-defined]
             except Exception:
                 pass
+            _t_log0 = time.time()
             await self.current_state.process_message(decoded_message, v2gtp_msg.payload)
+            _t_log1 = time.time()
+            try:
+                self._last_logic_ms = max(0.0, (_t_log1 - _t_log0) * 1000.0)  # type: ignore[attr-defined]
+                # Capture last encode time/size from EXI singleton
+                _exi2 = EXI()
+                self._last_encode_ms = float(getattr(_exi2, "last_to_exi_ms", 0.0))  # type: ignore[attr-defined]
+                self._last_exi_enc_bytes = int(getattr(_exi2, "last_to_exi_len", 0))  # type: ignore[attr-defined]
+            except Exception:
+                pass
             # Update duplicate fingerprint after successful processing
             try:
                 self._mark_new_request_fingerprint(v2gtp_msg.payload)
@@ -323,12 +342,12 @@ class SessionStateMachine(ABC):
 
         Uses a short time window and max resend count to avoid loops.
         """
-        # Do not auto-resend cached responses in time-sensitive phases like
-        # PreCharge or CurrentDemand. These phases require re-evaluating and
-        # reporting the latest EVSEPresentVoltage/Current on every request.
+        # Allow auto-resend during CurrentDemand to ensure byte-identical replay
+        # when EV repeats the exact same request within a short window.
+        # Still avoid auto-resend in PreCharge where live measurements are valuable.
         try:
             st_name = type(self.current_state).__name__
-            if st_name in ("PreCharge", "CurrentDemand", "DCPreCharge"):
+            if st_name in ("PreCharge", "DCPreCharge"):
                 return False
         except Exception:
             pass
@@ -433,6 +452,12 @@ class V2GCommunicationSession(SessionStateMachine):
         # EXI per-session capture
         self._exi_seq: int = 0
         self._exi_dir: Optional[str] = None
+        # Last-cycle timing breakdown (ms) and sizes (bytes) for diagnostics
+        self._last_decode_ms: float = 0.0
+        self._last_logic_ms: float = 0.0
+        self._last_encode_ms: float = 0.0
+        self._last_exi_dec_bytes: int = 0
+        self._last_exi_enc_bytes: int = 0
         if shared_settings.get(SettingKey.MESSAGE_LOG_PER_SESSION):
             base = shared_settings.get(SettingKey.EXI_SESSION_DIR)
             ts = time.strftime("%Y%m%d-%H%M%S")
@@ -858,10 +883,29 @@ class V2GCommunicationSession(SessionStateMachine):
                     await self.send(self.current_state.next_v2gtp_msg)
                 t1 = time.time()
                 try:
-                    if (t1 - t0) > 0.5:
-                        logger.warning(
-                            "Charge-loop processing latency high: %.0f ms", (t1 - t0) * 1000
-                        )
+                    # Allow environment override of latency warning threshold
+                    try:
+                        _lat_ms = float(os.environ.get("V2G_LATENCY_WARN_MS", "0"))
+                        latency_warn_s = _lat_ms / 1000.0 if _lat_ms > 0 else float(os.environ.get("V2G_LATENCY_WARN_S", "0"))
+                    except Exception:
+                        latency_warn_s = 0.0
+                    if latency_warn_s <= 0:
+                        latency_warn_s = 0.5
+                    if (t1 - t0) > latency_warn_s:
+                        try:
+                            logger.warning(
+                                "Charge-loop slow: total=%.0fms (decode=%.0fms, logic=%.0fms, encode=%.0fms) exi(dec=%dB, enc=%dB)",
+                                (t1 - t0) * 1000,
+                                float(self._last_decode_ms),
+                                float(self._last_logic_ms),
+                                float(self._last_encode_ms),
+                                int(self._last_exi_dec_bytes),
+                                int(self._last_exi_enc_bytes),
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Charge-loop processing latency high: %.0f ms", (t1 - t0) * 1000
+                            )
                 except Exception:
                     # Logging must not break state updates
                     pass
